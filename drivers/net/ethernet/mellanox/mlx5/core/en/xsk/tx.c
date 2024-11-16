@@ -68,6 +68,8 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 	union mlx5e_xdp_info xdpi;
 	bool work_done = true;
 	bool flush = false;
+	bool exnfc_flush = false;
+	u32 memcpy_frames = 0;
 
 	xdpi.mode = MLX5E_XDP_XMIT_MODE_XSK;
 
@@ -92,6 +94,13 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 			 * not completed frames.
 			 */
 			break;
+		}
+
+		if (desc.options & EXNFC_NO_TX) {
+			if (desc.options & EXNFC_NO_TX_FLUSH)
+				memcpy_frames++;
+			exnfc_flush = true;
+			continue;
 		}
 
 		xdptxd.dma_addr = xsk_buff_raw_get_dma(pool, desc.addr);
@@ -126,12 +135,19 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 		flush = true;
 	}
 
-	if (flush) {
+	if (flush || exnfc_flush) {
 		if (sq->mpwqe.wqe)
 			mlx5e_xdp_mpwqe_complete(sq);
 		mlx5e_xmit_xdp_doorbell(sq);
 
 		xsk_tx_release(pool);
+
+		// Only required in case of SPSC
+		// if (exnfc_flush)
+		// 	xdp_do_flush();
+
+		if (memcpy_frames)
+			xsk_tx_completed(pool, memcpy_frames);
 	}
 
 	return !(budget && work_done);

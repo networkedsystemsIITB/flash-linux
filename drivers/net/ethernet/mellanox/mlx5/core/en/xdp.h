@@ -168,18 +168,21 @@ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
  */
 static inline bool mlx5e_xdp_get_inline_state(struct mlx5e_xdpsq *sq, bool cur)
 {
-	u16 outstanding = sq->xdpi_fifo_pc - sq->xdpi_fifo_cc;
+// 	u16 outstanding = sq->xdpi_fifo_pc - sq->xdpi_fifo_cc;
 
-#define MLX5E_XDP_INLINE_WATERMARK_LOW	10
-#define MLX5E_XDP_INLINE_WATERMARK_HIGH 128
+// #define MLX5E_XDP_INLINE_WATERMARK_LOW	10
+// #define MLX5E_XDP_INLINE_WATERMARK_HIGH 128
 
-	if (cur && outstanding <= MLX5E_XDP_INLINE_WATERMARK_LOW)
-		return false;
+// 	if (cur && outstanding <= MLX5E_XDP_INLINE_WATERMARK_LOW)
+// 		return false;
 
-	if (!cur && outstanding >= MLX5E_XDP_INLINE_WATERMARK_HIGH)
-		return true;
+// 	if (!cur && outstanding >= MLX5E_XDP_INLINE_WATERMARK_HIGH)
+// 		return true;
 
-	return cur;
+// 	return cur;
+	(void) sq;
+	(void) cur;
+	return false;
 }
 
 static inline bool mlx5e_xdp_mpwqe_is_full(struct mlx5e_tx_mpwqe *session, u8 max_sq_mpw_wqebbs)
