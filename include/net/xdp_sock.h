@@ -96,6 +96,8 @@ struct xdp_sock {
 
 	/* Socked ID that is used for socket chaining (exnfc) */
 	int exnfc_id;
+	/* pointer to exnfc_obj */
+	void *exnfc_object;
 };
 
 /*
