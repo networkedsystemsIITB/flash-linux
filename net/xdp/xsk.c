@@ -30,6 +30,7 @@
 
 #include "xsk_queue.h"
 #include "xdp_umem.h"
+#include "xsk_sysfs.h"
 #include "xsk.h"
 
 #define TX_BATCH_SIZE 32
@@ -1321,6 +1322,17 @@ static int alloc_exnfc_id(struct xdp_sock *xs)
 	return retval;
 }
 
+static struct xdp_sock *find_xsk_by_exnfc_id(int id)
+{
+	struct xdp_sock *xs;
+	unsigned long flags;
+
+	spin_lock_irqsave(&exnfc_idr_lock, flags);
+	xs = idr_find(&exnfc_idr, id);
+	spin_unlock_irqrestore(&exnfc_idr_lock, flags);
+	return xs;
+}
+
 static void free_exnfc_id(int id)
 {
 	unsigned long flags;
@@ -1382,6 +1394,13 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	err = alloc_exnfc_id(xs);
 	if (err)
 		goto out_unlock;
+
+	/* Create exnfc object for sysfs */
+	xs->exnfc_object = (void *)create_exnfc_obj(xs->exnfc_id, current->pid, current->comm, sxdp->sxdp_ifindex, qid);
+	if (!xs->exnfc_object) {
+		err = -EINVAL;
+		goto out_unlock;
+	}
 
 	if (flags & XDP_SHARED_UMEM) {
 		struct xdp_sock *umem_xs;
@@ -1482,10 +1501,6 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 		}
 	}
 
-	/* Hardcoding chaining logic here. This is stupid!!! */
-	if (xs->exnfc_id != 0)
-		WRITE_ONCE(exnfc_xsk_map[(xs->exnfc_id - 1)], xs);
-
 	/* Debug (exnfc) */
 	printk("exnfc: exnfc_id = %d\n", xs->exnfc_id);
 
@@ -1513,6 +1528,36 @@ out_release:
 	mutex_unlock(&xs->mutex);
 	rtnl_unlock();
 	return err;
+}
+
+int exnfc_update_chain_map(int current_id, int next_id)
+{
+	struct xdp_sock *dst_xsk, *src_xsk;
+
+	src_xsk = find_xsk_by_exnfc_id(current_id);
+	if (src_xsk == NULL)
+		return -EINVAL;
+
+	if (src_xsk->state != XSK_READY && src_xsk->state != XSK_BOUND)
+		return -EBUSY;
+
+	if (next_id != -1) {
+		dst_xsk = find_xsk_by_exnfc_id(next_id);
+		if (dst_xsk == NULL)
+			return -EINVAL;
+
+		WRITE_ONCE(exnfc_xsk_map[src_xsk->exnfc_id], dst_xsk);
+	} else {
+		WRITE_ONCE(exnfc_xsk_map[src_xsk->exnfc_id], NULL);
+	}
+
+	/* Debug (show map list) */
+	for (int i = 0; i < EXNFC_MAX_XSK; i++) {
+		if (exnfc_xsk_map[i] != NULL)
+			printk("exnfc: exnfc_xsk_map[%d] = %d\n", i, exnfc_xsk_map[i]->exnfc_id);
+	}
+
+	return 0;
 }
 
 struct xdp_umem_reg_v1 {
@@ -1886,8 +1931,9 @@ static void xsk_destruct(struct sock *sk)
 	if (!xp_put_pool(xs->pool))
 		xdp_put_umem(xs->umem, !xs->pool);
 
-	/* Freeing up exnfc id (exnfc) */
+	/* Freeing up id and obj - can be used by new xsks (exnfc) */
 	free_exnfc_id(xs->exnfc_id);
+	destroy_exnfc_obj((struct exnfc_obj *)xs->exnfc_object);
 }
 
 static int xsk_create(struct net *net, struct socket *sock, int protocol,
@@ -1981,6 +2027,10 @@ static int __init xsk_init(void)
 		goto out_sk;
 
 	err = register_netdevice_notifier(&xsk_netdev_notifier);
+	if (err)
+		goto out_pernet;
+	
+	err = exnfc_sysfs_init();
 	if (err)
 		goto out_pernet;
 
