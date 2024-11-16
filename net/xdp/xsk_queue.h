@@ -13,6 +13,7 @@
 
 #include "xsk.h"
 
+/* SPMC or MPSC */
 struct xdp_ring {
 	u32 producer ____cacheline_aligned_in_smp;
 	/* Hinder the adjacent cache prefetcher to prefetch the consumer
@@ -23,6 +24,10 @@ struct xdp_ring {
 	u32 pad2 ____cacheline_aligned_in_smp;
 	u32 flags;
 	u32 pad3 ____cacheline_aligned_in_smp;
+	u32 producer_head ____cacheline_aligned_in_smp;
+	u32 pad4 ____cacheline_aligned_in_smp;
+	u32 consumer_head ____cacheline_aligned_in_smp;
+	u32 pad5 ____cacheline_aligned_in_smp;
 };
 
 /* Used for the RX and TX queues for packets */
@@ -457,6 +462,213 @@ static inline u64 xskq_nb_invalid_descs(struct xsk_queue *q)
 static inline u64 xskq_nb_queue_empty_descs(struct xsk_queue *q)
 {
 	return q ? q->queue_empty_descs : 0;
+}
+
+/* SPMC or MPSC operations */
+
+static inline u32 xskq_cons_available_entries(struct xsk_queue *q, u32 max)
+{
+	struct xdp_ring *ring = (struct xdp_ring *)q->ring;
+	u32 entries = READ_ONCE(ring->producer) - READ_ONCE(ring->consumer_head);
+
+	return entries >= max ? max : entries;
+}
+
+static inline u32 xskq_move_prod_head(struct xsk_queue *q, u32 n, u32 *old_head, u32 *new_head)
+{
+    const u32 capacity = q->nentries;
+    u32 max = n;
+    int success;
+    u32 free_entries;
+ 
+    struct xdp_ring *ring = (struct xdp_ring *)q->ring;
+ 
+    do {
+        /* Reset n to the initial burst count */
+        n = max;
+ 
+        *old_head = READ_ONCE(ring->producer_head);
+ 
+        /* add rmb barrier to avoid load/load reorder in weak
+         * memory model. It is noop on x86
+         */
+        smp_rmb();
+ 
+        /*
+         *  The subtraction is done between two unsigned 32bits value
+         * (the result is always modulo 32 bits even if we have
+         * *old_head > cons_tail). So 'free_entries' is always between 0
+         * and capacity (which is < size).
+         */
+        free_entries = (capacity + READ_ONCE(ring->consumer) - *old_head);
+        if (unlikely(n > free_entries))
+            n = free_entries;
+        
+        if (n == 0)
+            return 0;
+ 
+        *new_head = *old_head + n;
+        success = (cmpxchg(&ring->producer_head, *old_head, *new_head) == *old_head);
+    } while (unlikely(success == 0));
+
+    return n;
+}
+
+static inline u32 xskq_move_cons_head(struct xsk_queue *q, u32 n, u32 *old_head, u32 *new_head)
+{
+    u32 max = n;
+    int success;
+    u32 entries;
+	
+    struct xdp_ring *ring = (struct xdp_ring *)q->ring;
+ 
+    do {
+        /* Reset n to the initial burst count */
+        n = max;
+ 
+        *old_head = READ_ONCE(ring->consumer_head);
+ 
+        /* add rmb barrier to avoid load/load reorder in weak
+         * memory model. It is noop on x86
+         */
+        smp_rmb();
+ 
+        /*
+         *  The subtraction is done between two unsigned 32bits value
+         * (the result is always modulo 32 bits even if we have
+         * *old_head > cons_tail). So 'free_entries' is always between 0
+         * and capacity (which is < size).
+         */
+        entries = READ_ONCE(ring->producer) - *old_head;
+        if (n > entries)
+            n = entries;
+        
+        if (unlikely(n == 0))
+            return 0;
+
+        *new_head = *old_head + n;
+        success = (cmpxchg(&ring->consumer_head, *old_head, *new_head) == *old_head);
+    } while (unlikely(success == 0));
+
+    return n;
+}
+
+static inline void xskq_update_prod_tail(struct xdp_ring *ring, u32 old_val, u32 new_val)
+{
+    smp_wmb();
+ 
+    while (readl(&ring->producer) != old_val) {
+        cpu_relax();
+    }
+ 
+    writel(new_val, &ring->producer);
+}
+
+static inline void xskq_update_cons_tail(struct xdp_ring *ring, u32 old_val, u32 new_val)
+{
+    smp_rmb();
+
+    while (readl(&ring->consumer) != old_val) {
+        cpu_relax();
+    }
+
+    writel(new_val, &ring->consumer);
+}
+
+static inline int xskq_enqueue_rxtx(struct xsk_queue *q, u64 addr, u32 len, u32 flags)
+{	
+	u32 prod_head;
+	u32 prod_next;
+
+	u32 idx;
+
+	u32 n = xskq_move_prod_head(q, 1, &prod_head, &prod_next);
+
+	// Ring full
+	if(n == 0) 
+		return -ENOBUFS;
+
+	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
+	
+	idx = prod_head & q->ring_mask;
+	ring->desc[idx].addr = addr;
+	ring->desc[idx].len = len;
+	ring->desc[idx].options = flags;
+
+	xskq_update_prod_tail((struct xdp_ring *)ring, prod_head, prod_next);
+
+	return 0;
+}
+
+static inline int xskq_enqueue_umem(struct xsk_queue *q, u64 addr)
+{	
+	u32 prod_head;
+	u32 prod_next;
+
+	u32 idx;
+
+	u32 n = xskq_move_prod_head(q, 1, &prod_head, &prod_next);
+
+	// Ring full
+	if(n == 0) 
+		return -ENOBUFS;
+
+	struct xdp_umem_ring *ring = (struct xdp_umem_ring *)q->ring;
+	
+	idx = prod_head & q->ring_mask;
+	ring->desc[idx] = addr;
+
+	xskq_update_prod_tail((struct xdp_ring *)ring, prod_head, prod_next);
+
+	return 0;
+}
+
+static inline bool xskq_dequeue_rxtx(struct xsk_queue *q, struct xdp_desc* desc, struct xsk_buff_pool *pool)
+{	
+	u32 cons_head;
+	u32 cons_next;
+
+	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
+	u32 idx;
+
+	u32 n = xskq_move_cons_head(q, 1, &cons_head, &cons_next);
+
+	// Ring empty
+	if(n == 0) 
+		return false;
+
+	/* A, matches D */
+	idx = cons_head & q->ring_mask;
+	*desc = ring->desc[idx];
+
+	xskq_update_cons_tail((struct xdp_ring *)ring, cons_head, cons_next);
+
+	if(pool)
+		return xskq_cons_is_valid_desc(q, desc, pool);
+	return true;
+}
+
+static inline bool xskq_dequeue_umem(struct xsk_queue *q, u64* addr)
+{	
+	u32 cons_head;
+	u32 cons_next;
+
+	struct xdp_umem_ring *ring = (struct xdp_umem_ring *)q->ring;
+	u32 idx;
+
+	u32 n = xskq_move_cons_head(q, 1, &cons_head, &cons_next);
+
+	// Ring empty
+	if(n == 0) 
+		return false;
+
+	/* A, matches D */
+	idx = cons_head & q->ring_mask;
+	*addr = ring->desc[idx];
+
+	xskq_update_cons_tail((struct xdp_ring *)ring, cons_head, cons_next);
+
+	return true;
 }
 
 struct xsk_queue *xskq_create(u32 nentries, bool umem_queue);

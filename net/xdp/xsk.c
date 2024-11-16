@@ -34,8 +34,17 @@
 
 #define TX_BATCH_SIZE 32
 #define MAX_PER_SOCKET_BUDGET (TX_BATCH_SIZE)
+#define EXNFC_MAX_XSK 64 /* Maximum number of XSKs that can be chained - [TODO: Dydnamic] (exnfc) */
 
 static DEFINE_PER_CPU(struct list_head, xskmap_flush_list);
+static DEFINE_IDR(exnfc_idr); /* IDR allocation (exnfc) */
+
+/* Lock to protect idr acceses (exnfc) */
+static DEFINE_SPINLOCK(exnfc_idr_lock);
+
+/* exnfc XSK map (exnfc) - Only use atomic operation for r/w operation */
+static struct xdp_sock *exnfc_xsk_map[EXNFC_MAX_XSK] = {NULL};
+
 
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
 {
@@ -144,7 +153,11 @@ static int __xsk_rcv_zc(struct xdp_sock *xs, struct xdp_buff_xsk *xskb, u32 len,
 	int err;
 
 	addr = xp_get_handle(xskb);
-	err = xskq_prod_reserve_desc(xs->rx, addr, len, flags);
+	/* Original */
+	// err = xskq_prod_reserve_desc(xs->rx, addr, len, flags);
+
+	/* MPSC */
+	err = xskq_enqueue_rxtx(xs->rx, addr, len, flags);
 	if (err) {
 		xs->rx_queue_full++;
 		return err;
@@ -372,15 +385,17 @@ static int xsk_rcv(struct xdp_sock *xs, struct xdp_buff *xdp)
 
 int __xsk_map_redirect(struct xdp_sock *xs, struct xdp_buff *xdp)
 {
-	struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
+	/* Not required for MPSC */	
+	// struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
 	int err;
 
 	err = xsk_rcv(xs, xdp);
 	if (err)
 		return err;
 
-	if (!xs->flush_node.prev)
-		list_add(&xs->flush_node, flush_list);
+	/* Not required for MPSC */	
+	// if (!xs->flush_node.prev)
+	// 	list_add(&xs->flush_node, flush_list);
 
 	return 0;
 }
@@ -430,6 +445,10 @@ bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 {
 	bool budget_exhausted = false;
 	struct xdp_sock *xs;
+	struct xdp_sock *exnfc_xs; /* Next socket to send (exnfc) */
+	int err;
+	/* not required for MPSC */
+	// struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
 
 	rcu_read_lock();
 again:
@@ -446,6 +465,103 @@ again:
 		}
 
 		xs->tx_budget_spent++;
+
+		/* exnfc magic */
+		if (exnfc_xsk_map[xs->exnfc_id] != NULL) {
+			exnfc_xs = exnfc_xsk_map[xs->exnfc_id];
+
+			/* Zero-copy magic - SPSC or MPSC */
+			if (pool->umem == exnfc_xs->pool->umem) {
+				/* SPSC - one softirq chaining
+				 * TODO: one softirq chaining implementation integration
+				 */
+				// err = xskq_prod_reserve_desc(exnfc_xs->rx, desc->addr, desc->len, desc->options);
+
+				/* MPSC*/
+				err = xskq_enqueue_rxtx(exnfc_xs->rx, desc->addr, desc->len, desc->options);
+
+				if (err) {
+					exnfc_xs->rx_queue_full++;
+					goto out;
+				}
+
+				/* Only required for MPSC - start */
+				struct xdp_buff *xsk_xdp;
+				struct xdp_buff_xsk *xskb;
+
+				xsk_xdp = xsk_buff_alloc(exnfc_xs->pool);
+				if (!xsk_xdp) {
+					exnfc_xs->rx_dropped++;
+					goto out;
+				}
+
+				xskb = container_of(xsk_xdp, struct xdp_buff_xsk, xdp);
+
+				u64 addr = xp_get_handle(xskb);
+				/* Only required for MPSC - end */
+
+				/* Backpressure for MPSC */
+				if (xskq_prod_reserve_addr(pool->cq, addr))
+					goto out;
+
+				/* Backpressure for SPSC */
+				// if (xskq_prod_reserve_addr(pool->cq, desc->addr))
+				// 	goto out;
+
+				/* Adding exnfc xs to the flush_list if not added yet */
+				/* Not required for MPSC */
+				// if (!exnfc_xs->flush_node.prev)
+				// 	list_add(&exnfc_xs->flush_node, flush_list);
+				
+				// This is also required to be cleaned up
+				// desc->options |= EXNFC_NO_TX;
+
+				/* Only required for MPSC */
+				desc->options |= (EXNFC_NO_TX_FLUSH | EXNFC_NO_TX);
+
+				xskq_cons_release(xs->tx);
+				rcu_read_unlock();
+				return true;
+			}
+
+			/* memcpy magic - MPSC required */
+			if (!xsk_is_bound(exnfc_xs)) {
+				printk(KERN_WARNING "exnfc: exnfc_xs is not bound\n");
+				goto out;
+			}
+
+			u32 frame_size = xsk_pool_get_rx_frame_size(exnfc_xs->pool);
+			void *copy_from = xsk_buff_raw_get_data(pool, desc->addr);
+
+			struct xdp_buff_xsk *xskb;
+			struct xdp_buff *xsk_xdp;
+
+			if (desc->len <= frame_size && !xp_mb_desc(desc)) {
+				xsk_xdp = xsk_buff_alloc(exnfc_xs->pool);
+				if (!xsk_xdp) {
+					exnfc_xs->rx_dropped++;
+					goto out;
+				}
+
+				memcpy(xsk_xdp->data, copy_from, desc->len);
+				xskb = container_of(xsk_xdp, struct xdp_buff_xsk, xdp);
+				err = __xsk_rcv_zc(exnfc_xs, xskb, desc->len, desc->options);
+				if (err) {
+					xsk_buff_free(xsk_xdp);
+					goto out;
+				}
+
+				/* Backpressure */
+				if (xskq_prod_reserve_addr(pool->cq, desc->addr))
+					goto out;
+				
+				desc->options |= (EXNFC_NO_TX_FLUSH | EXNFC_NO_TX);
+
+				xskq_cons_release(xs->tx);
+				rcu_read_unlock();
+				return true;
+			}
+		}
 
 		/* This is the backpressure mechanism for the Tx path.
 		 * Reserve space in the completion queue and only proceed
@@ -478,11 +594,31 @@ static u32 xsk_tx_peek_release_fallback(struct xsk_buff_pool *pool, u32 max_entr
 {
 	struct xdp_desc *descs = pool->tx_descs;
 	u32 nb_pkts = 0;
+	u32 total_pkts = 0;
+	bool mc = false;
 
-	while (nb_pkts < max_entries && xsk_tx_peek_desc(pool, &descs[nb_pkts]))
-		nb_pkts++;
+	/* TODO - optimization */
+	while (total_pkts < max_entries && xsk_tx_peek_desc(pool, &descs[nb_pkts])) {
+		total_pkts++;
+		if (descs[nb_pkts].options & EXNFC_NO_TX) {
+			if (descs[nb_pkts].options & EXNFC_NO_TX_FLUSH)
+				mc = true;
+			continue;
+		} else
+			nb_pkts++;
+	}
 
 	xsk_tx_release(pool);
+	/* TODO: Check if this is required */
+	// pool->total_cnt = total_pkts;
+
+	if (nb_pkts != total_pkts) {
+		if (mc)
+			xskq_prod_submit(pool->cq);
+		/* Not required for MPSC */
+		// xdp_do_flush();
+	}
+
 	return nb_pkts;
 }
 
@@ -492,7 +628,9 @@ u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 nb_pkts)
 
 	rcu_read_lock();
 	if (!list_is_singular(&pool->xsk_tx_list)) {
-		/* Fallback to the non-batched version */
+		/* Fallback to the non-batched version 
+		 * also take care of zero-copy SPSC scenario
+		 */
 		rcu_read_unlock();
 		return xsk_tx_peek_release_fallback(pool, nb_pkts);
 	}
@@ -502,6 +640,14 @@ u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 nb_pkts)
 		nb_pkts = 0;
 		goto out;
 	}
+
+	/* this is for MPSC zero-copy and memcpy fallback
+	 * TODO: FIX this
+	 */
+	// if (exnfc_xsk_map[xs->exnfc_id] != NULL) {
+	// 	rcu_read_unlock();
+	// 	return xsk_tx_peek_release_fallback(pool, nb_pkts);
+	// }
 
 	nb_pkts = xskq_cons_nb_entries(xs->tx, nb_pkts);
 
@@ -526,6 +672,8 @@ u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 nb_pkts)
 	xs->sk.sk_write_space(&xs->sk);
 
 out:
+	/* TODO: Check if this is required */
+	// pool->total_cnt = nb_pkts;
 	rcu_read_unlock();
 	return nb_pkts;
 }
@@ -1155,6 +1303,37 @@ static bool xsk_validate_queues(struct xdp_sock *xs)
 	return xs->fq_tmp && xs->cq_tmp;
 }
 
+static int alloc_exnfc_id(struct xdp_sock *xs)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&exnfc_idr_lock, flags);
+	retval = idr_alloc(&exnfc_idr, xs, 0, EXNFC_MAX_XSK, GFP_KERNEL);
+	if (retval >= 0) {
+		xs->exnfc_id = retval;
+		retval = 0;
+	} else if (retval == -ENOSPC) {
+		printk(KERN_WARNING "exnfc: Exceeded maximum number of XSKs\n");
+		retval = -EINVAL;
+	}
+	spin_unlock_irqrestore(&exnfc_idr_lock, flags);
+	return retval;
+}
+
+static void free_exnfc_id(int id)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&exnfc_idr_lock, flags);
+	struct xdp_sock *exnfc_xs = idr_find(&exnfc_idr, id);
+	for (int i = 0; i < EXNFC_MAX_XSK; i++) {
+		if (exnfc_xsk_map[i] == exnfc_xs)
+			WRITE_ONCE(exnfc_xsk_map[i], NULL);
+	}
+	idr_remove(&exnfc_idr, id);
+	spin_unlock_irqrestore(&exnfc_idr_lock, flags);
+}
+
 static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 {
 	struct sockaddr_xdp *sxdp = (struct sockaddr_xdp *)addr;
@@ -1198,6 +1377,11 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	}
 
 	qid = sxdp->sxdp_queue_id;
+
+	/* Allocate exnfc id and store the pointer (exnfc) */
+	err = alloc_exnfc_id(xs);
+	if (err)
+		goto out_unlock;
 
 	if (flags & XDP_SHARED_UMEM) {
 		struct xdp_sock *umem_xs;
@@ -1297,6 +1481,13 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 			goto out_unlock;
 		}
 	}
+
+	/* Hardcoding chaining logic here. This is stupid!!! */
+	if (xs->exnfc_id != 0)
+		WRITE_ONCE(exnfc_xsk_map[(xs->exnfc_id - 1)], xs);
+
+	/* Debug (exnfc) */
+	printk("exnfc: exnfc_id = %d\n", xs->exnfc_id);
 
 	/* FQ and CQ are now owned by the buffer pool and cleaned up with it. */
 	xs->fq_tmp = NULL;
@@ -1694,6 +1885,9 @@ static void xsk_destruct(struct sock *sk)
 
 	if (!xp_put_pool(xs->pool))
 		xdp_put_umem(xs->umem, !xs->pool);
+
+	/* Freeing up exnfc id (exnfc) */
+	free_exnfc_id(xs->exnfc_id);
 }
 
 static int xsk_create(struct net *net, struct socket *sock, int protocol,
