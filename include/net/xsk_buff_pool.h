@@ -69,6 +69,9 @@ struct xsk_buff_pool {
 	dma_addr_t *dma_pages;
 	struct xdp_buff_xsk *heads;
 	struct xdp_desc *tx_descs;
+	u32 n_tx_descs;	// Batching tx num
+	struct xdp_buff **fq_buff_batch; // Batching exnfc
+	struct xdp_desc* fq_descs; // Batching exnfc
 	u64 chunk_mask;
 	u64 addrs_cnt;
 	u32 free_list_cnt;

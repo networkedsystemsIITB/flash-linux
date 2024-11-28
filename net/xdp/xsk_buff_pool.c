@@ -37,6 +37,8 @@ void xp_destroy(struct xsk_buff_pool *pool)
 	if (!pool)
 		return;
 
+	kvfree(pool->fq_buff_batch); // Batching
+	kvfree(pool->fq_descs); // Batching
 	kvfree(pool->tx_descs);
 	kvfree(pool->heads);
 	kvfree(pool);
@@ -72,6 +74,8 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	if (xs->tx)
 		if (xp_alloc_tx_descs(pool, xs))
 			goto out;
+		
+	pool->n_tx_descs = 0; // Batching
 
 	pool->chunk_mask = ~((u64)umem->chunk_size - 1);
 	pool->addrs_cnt = umem->size;
@@ -96,6 +100,16 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 
 	pool->fq = xs->fq_tmp;
 	pool->cq = xs->cq_tmp;
+
+	// Batching start
+	pool->fq_buff_batch = kvcalloc(pool->fq->nentries, sizeof(struct xdp_buff *), GFP_KERNEL);
+	if (!pool->fq_buff_batch)
+		goto out;
+
+	pool->fq_descs = kvcalloc(pool->fq->nentries, sizeof(struct xdp_desc), GFP_KERNEL);
+	if (!pool->fq_descs)
+		goto out;
+	// Batching end
 
 	for (i = 0; i < pool->free_heads_cnt; i++) {
 		xskb = &pool->heads[i];
@@ -616,6 +630,12 @@ static u32 xp_alloc_new_from_fq(struct xsk_buff_pool *pool, struct xdp_buff **xd
 		} else {
 			xskb = &pool->heads[xp_aligned_extract_idx(pool, addr)];
 		}
+
+		// Batching start
+		xskb->xdp.data = xskb->xdp.data_hard_start + XDP_PACKET_HEADROOM;
+		xskb->xdp.data_meta = xskb->xdp.data;
+		xskb->xdp.flags = 0;
+		// Batching end
 
 		*xdp = &xskb->xdp;
 		xdp++;
