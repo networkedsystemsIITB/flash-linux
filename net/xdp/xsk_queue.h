@@ -48,6 +48,8 @@ struct xsk_queue {
 	u32 cached_prod;
 	u32 cached_cons;
 	struct xdp_ring *ring;
+	struct xdp_desc *rx_descs; // Rx Batching
+	u32 n_rx_descs; // Rx Batching
 	u64 invalid_descs;
 	u64 queue_empty_descs;
 	size_t ring_vmalloc_size;

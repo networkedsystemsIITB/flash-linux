@@ -77,6 +77,11 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 		
 	pool->n_tx_descs = 0; // Batching
 
+	xs->rx->n_rx_descs = 0; // Rx Batching
+	xs->rx->rx_descs = kvcalloc(xs->rx->nentries, sizeof(struct xdp_desc), GFP_KERNEL); // Rx Batching
+	if(!xs->rx->rx_descs) // Rx Batching
+		goto out; // Rx Batching
+
 	pool->chunk_mask = ~((u64)umem->chunk_size - 1);
 	pool->addrs_cnt = umem->size;
 	pool->heads_cnt = umem->chunks;

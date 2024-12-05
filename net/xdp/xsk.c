@@ -151,18 +151,24 @@ static int __xsk_rcv_zc(struct xdp_sock *xs, struct xdp_buff_xsk *xskb, u32 len,
 			u32 flags)
 {
 	u64 addr;
-	int err;
+	// int err;
 
 	addr = xp_get_handle(xskb);
 	/* Original */
 	// err = xskq_prod_reserve_desc(xs->rx, addr, len, flags);
 
 	/* MPSC */
-	err = xskq_enqueue_rxtx(xs->rx, addr, len, flags);
-	if (err) {
-		xs->rx_queue_full++;
-		return err;
-	}
+	// err = xskq_enqueue_rxtx(xs->rx, addr, len, flags);
+	// if (err) {
+	// 	xs->rx_queue_full++;
+	// 	return err;
+	// }
+
+	/* Batching Rx */
+	xs->rx->rx_descs[xs->rx->n_rx_descs].addr = addr;
+	xs->rx->rx_descs[xs->rx->n_rx_descs].len = len;
+	xs->rx->rx_descs[xs->rx->n_rx_descs].options = flags;
+	xs->rx->n_rx_descs++;
 
 	xp_release(xskb);
 	return 0;
@@ -344,8 +350,20 @@ static int xsk_rcv_check(struct xdp_sock *xs, struct xdp_buff *xdp, u32 len)
 
 static void xsk_flush(struct xdp_sock *xs)
 {
-	xskq_prod_submit(xs->rx);
-	__xskq_cons_release(xs->pool->fq);
+	/* Original */
+	// xskq_prod_submit(xs->rx); 
+	// __xskq_cons_release(xs->pool->fq);
+
+	/* Batching Rx */
+	int err;
+	err = xskq_bulk_enqueue_rxtx(xs->rx, xs->rx->rx_descs, xs->rx->n_rx_descs);
+	if (err) {
+		xs->rx_queue_full++;
+		xs->rx->n_rx_descs = 0;
+		return;
+	}
+
+	xs->rx->n_rx_descs = 0;
 	sock_def_readable(&xs->sk);
 }
 
@@ -387,7 +405,7 @@ static int xsk_rcv(struct xdp_sock *xs, struct xdp_buff *xdp)
 int __xsk_map_redirect(struct xdp_sock *xs, struct xdp_buff *xdp)
 {
 	/* Not required for MPSC */	
-	// struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
+	struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
 	int err;
 
 	err = xsk_rcv(xs, xdp);
@@ -395,8 +413,8 @@ int __xsk_map_redirect(struct xdp_sock *xs, struct xdp_buff *xdp)
 		return err;
 
 	/* Not required for MPSC */	
-	// if (!xs->flush_node.prev)
-	// 	list_add(&xs->flush_node, flush_list);
+	if (!xs->flush_node.prev)
+		list_add(&xs->flush_node, flush_list);
 
 	return 0;
 }
@@ -474,6 +492,7 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 
 				if (err) {
 					exnfc_xs->rx_queue_full++;
+					pool->n_tx_descs = 0;
 					rcu_read_unlock();
 					return;
 				}
@@ -485,6 +504,7 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 				/* memcpy magic - MPSC required */
 				if (!xsk_is_bound(exnfc_xs)) {
 					printk(KERN_WARNING "exnfc: exnfc_xs is not bound\n");
+					pool->n_tx_descs = 0;
 					rcu_read_unlock();
 					return;
 				}
@@ -507,6 +527,7 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 				err = xskq_bulk_enqueue_rxtx(exnfc_xs->rx, fq_descs, fq_entries);
 				if (err) {
 					exnfc_xs->rx_queue_full++;
+					pool->n_tx_descs = 0;
 					rcu_read_unlock();
 					return;
 				}
@@ -2082,6 +2103,9 @@ static void xsk_destruct(struct sock *sk)
 
 	if (!xp_put_pool(xs->pool))
 		xdp_put_umem(xs->umem, !xs->pool);
+
+	// Batching Rx
+	kvfree(xs->rx->rx_descs);
 
 	/* Freeing up id and obj - can be used by new xsks (exnfc) */
 	free_exnfc_id(xs->exnfc_id);
