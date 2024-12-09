@@ -459,17 +459,17 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 			xs->sk.sk_write_space(&xs->sk);
 
 		/* Batching tx */
-		if(list_is_singular(&pool->xsk_tx_list) && pool->n_tx_descs > 0 && exnfc_xsk_map[xs->exnfc_id] != NULL) {
+		if(list_is_singular(&pool->xsk_tx_list) && pool->n_chain_tx_descs > 0 && exnfc_xsk_map[xs->exnfc_id] != NULL) {
 			u32 fq_entries = 0;
-			u32 n_tx_descs = pool->n_tx_descs;
+			u32 n_chain_tx_descs = pool->n_chain_tx_descs;
 
 			// Get next socket
 			exnfc_xs = exnfc_xsk_map[xs->exnfc_id];
 
 			// Get array of pointers to fq buffs
-			// struct xdp_buff *xsk_xdp_batch[n_tx_descs];
+			// struct xdp_buff *xsk_xdp_batch[n_chain_tx_descs];
 			struct xdp_buff **fq_buff_batch = pool->fq_buff_batch;
-			fq_entries = xsk_buff_alloc_batch(exnfc_xs->pool, fq_buff_batch, n_tx_descs);
+			fq_entries = xsk_buff_alloc_batch(exnfc_xs->pool, fq_buff_batch, n_chain_tx_descs);
 
 			// Convert buffs to descs
 			// struct xdp_desc fq_descs[fq_entries];
@@ -480,38 +480,38 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 				xskb = container_of(fq_buff_batch[i], struct xdp_buff_xsk, xdp);
 				addr = xp_get_handle(xskb);
 				fq_descs[i].addr = addr;
-				fq_descs[i].len = pool->tx_descs[i].len;
-				fq_descs[i].options = pool->tx_descs[i].options;
+				fq_descs[i].len = pool->chain_tx_descs[i].len;
+				fq_descs[i].options = pool->chain_tx_descs[i].options;
 			}
 
 			if (pool->umem == exnfc_xs->pool->umem) {
 				/* Zero-copy magic - SPSC or MPSC */
 				/* MPSC */
 				// Enqueue tx_descs to rx ring of next socket
-				err = xskq_bulk_enqueue_rxtx(exnfc_xs->rx, pool->tx_descs, fq_entries);
+				err = xskq_bulk_enqueue_rxtx(exnfc_xs->rx, pool->chain_tx_descs, fq_entries);
 
 				if (err) {
 					exnfc_xs->rx_queue_full++;
-					pool->n_tx_descs = 0;
+					pool->n_chain_tx_descs = 0;
 					rcu_read_unlock();
 					return;
 				}
 
 				// Add fq_descs of next socket to cq
-				pool->cq->cached_prod -= n_tx_descs;
+				pool->cq->cached_prod -= n_chain_tx_descs;
 				xskq_prod_write_addr_batch(pool->cq, fq_descs, fq_entries);
 			} else {
 				/* memcpy magic - MPSC required */
 				if (!xsk_is_bound(exnfc_xs)) {
 					printk(KERN_WARNING "exnfc: exnfc_xs is not bound\n");
-					pool->n_tx_descs = 0;
+					pool->n_chain_tx_descs = 0;
 					rcu_read_unlock();
 					return;
 				}
 
 				// Memcpy packets
 				for(u32 i=0; i<fq_entries; i++){
-					struct xdp_desc* desc = &(pool->tx_descs[i]);
+					struct xdp_desc* desc = &(pool->chain_tx_descs[i]);
 					u32 frame_size = xsk_pool_get_rx_frame_size(exnfc_xs->pool);
 
 					void *copy_from = xsk_buff_raw_get_data(pool, desc->addr);
@@ -527,17 +527,17 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 				err = xskq_bulk_enqueue_rxtx(exnfc_xs->rx, fq_descs, fq_entries);
 				if (err) {
 					exnfc_xs->rx_queue_full++;
-					pool->n_tx_descs = 0;
+					pool->n_chain_tx_descs = 0;
 					rcu_read_unlock();
 					return;
 				}
 
 				// Add tx_descs to cq
-				pool->cq->cached_prod -= n_tx_descs;
-				xskq_prod_write_addr_batch(pool->cq, pool->tx_descs, fq_entries);
+				pool->cq->cached_prod -= n_chain_tx_descs;
+				xskq_prod_write_addr_batch(pool->cq, pool->chain_tx_descs, fq_entries);
 			}
 
-			pool->n_tx_descs = 0;
+			pool->n_chain_tx_descs = 0;
 			rcu_read_unlock();
 			return;
 		}
@@ -572,8 +572,8 @@ again:
 		/* exnfc magic */
 		if (list_is_singular(&pool->xsk_tx_list) && exnfc_xsk_map[xs->exnfc_id] != NULL) {
 			/* Batching tx */
-			pool->tx_descs[pool->n_tx_descs] = *desc;
-			pool->n_tx_descs++;
+			pool->chain_tx_descs[pool->n_chain_tx_descs] = *desc;
+			pool->n_chain_tx_descs++;
 
 			// Back Pressure
 			if (xskq_prod_reserve(pool->cq))
@@ -1643,6 +1643,16 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 			 */
 			if (xs->tx && !xs->pool->tx_descs) {
 				err = xp_alloc_tx_descs(xs->pool, xs);
+				if (err) {
+					xp_put_pool(xs->pool);
+					xs->pool = NULL;
+					sockfd_put(sock);
+					goto out_unlock;
+				}
+			}
+
+			if (xs->tx && !xs->pool->chain_tx_descs) {
+				err = xp_alloc_chain_tx_descs(xs->pool, xs);
 				if (err) {
 					xp_put_pool(xs->pool);
 					xs->pool = NULL;

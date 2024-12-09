@@ -40,6 +40,7 @@ void xp_destroy(struct xsk_buff_pool *pool)
 	kvfree(pool->fq_buff_batch); // Batching
 	kvfree(pool->fq_descs); // Batching
 	kvfree(pool->tx_descs);
+	kvfree(pool->chain_tx_descs); // Batching
 	kvfree(pool->heads);
 	kvfree(pool);
 }
@@ -49,6 +50,16 @@ int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 	pool->tx_descs = kvcalloc(xs->tx->nentries, sizeof(*pool->tx_descs),
 				  GFP_KERNEL);
 	if (!pool->tx_descs)
+		return -ENOMEM;
+
+	return 0;
+}
+
+int xp_alloc_chain_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
+{
+	pool->chain_tx_descs = kvcalloc(xs->tx->nentries, sizeof(*pool->chain_tx_descs),
+				  GFP_KERNEL);
+	if (!pool->chain_tx_descs)
 		return -ENOMEM;
 
 	return 0;
@@ -74,8 +85,12 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	if (xs->tx)
 		if (xp_alloc_tx_descs(pool, xs))
 			goto out;
+
+	if (xs->tx)
+		if (xp_alloc_chain_tx_descs(pool,xs))
+			goto out;
 		
-	pool->n_tx_descs = 0; // Batching
+	pool->n_chain_tx_descs = 0; // Batching
 
 	xs->rx->n_rx_descs = 0; // Rx Batching
 	xs->rx->rx_descs = kvcalloc(xs->rx->nentries, sizeof(struct xdp_desc), GFP_KERNEL); // Rx Batching
