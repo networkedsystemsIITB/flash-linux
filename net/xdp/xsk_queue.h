@@ -48,8 +48,8 @@ struct xsk_queue {
 	u32 cached_prod;
 	u32 cached_cons;
 	struct xdp_ring *ring;
-	struct xdp_desc *rx_descs; // Rx Batching
-	u32 n_rx_descs; // Rx Batching
+	struct xdp_desc *rx_descs; /* For rx batching in flash */
+	u32 n_rx_descs; /* For rx batching in flash */
 	u64 invalid_descs;
 	u64 queue_empty_descs;
 	size_t ring_vmalloc_size;
@@ -586,7 +586,7 @@ static inline int xskq_enqueue_rxtx(struct xsk_queue *q, u64 addr, u32 len, u32 
 
 	u32 n = xskq_move_prod_head(q, 1, &prod_head, &prod_next);
 
-	// Ring full
+	/* Ring full */
 	if(n == 0) 
 		return -ENOBUFS;
 
@@ -611,7 +611,7 @@ static inline int xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* d
 
 	u32 n = xskq_move_prod_head(q, n_descs, &prod_head, &prod_next);
 
-	// Ring full
+	/* Ring full */
 	if(n == 0) 
 		return -ENOBUFS;
 
@@ -637,7 +637,7 @@ static inline int xskq_enqueue_umem(struct xsk_queue *q, u64 addr)
 
 	u32 n = xskq_move_prod_head(q, 1, &prod_head, &prod_next);
 
-	// Ring full
+	/* Ring full */
 	if(n == 0) 
 		return -ENOBUFS;
 
@@ -661,7 +661,7 @@ static inline bool xskq_dequeue_rxtx(struct xsk_queue *q, struct xdp_desc* desc,
 
 	u32 n = xskq_move_cons_head(q, 1, &cons_head, &cons_next);
 
-	// Ring empty
+	/* Ring empty */
 	if(n == 0) 
 		return false;
 
@@ -686,7 +686,7 @@ static inline bool xskq_dequeue_umem(struct xsk_queue *q, u64* addr)
 
 	u32 n = xskq_move_cons_head(q, 1, &cons_head, &cons_next);
 
-	// Ring empty
+	/* Ring empty */
 	if(n == 0) 
 		return false;
 

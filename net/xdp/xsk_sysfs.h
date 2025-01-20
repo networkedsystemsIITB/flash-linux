@@ -16,7 +16,7 @@
  * This is our "object" that we will create on socket creation and register them with
  * sysfs.
  */
-struct exnfc_obj {
+struct flash_obj {
     struct kobject kobj;
     int pid;
     char procname[16];
@@ -24,19 +24,19 @@ struct exnfc_obj {
     int qid;
     int next;
 };
-#define to_exnfc_obj(x) container_of(x, struct exnfc_obj, kobj)
+#define to_flash_obj(x) container_of(x, struct flash_obj, kobj)
 
-/* a custom attribute that works just for a struct exnfc_obj. */
-struct exnfc_attribute {
+/* a custom attribute that works just for a struct flash_obj. */
+struct flash_attribute {
 	struct attribute attr;
-	ssize_t (*show)(struct exnfc_obj *obj, struct exnfc_attribute *attr, char *buf);
-	ssize_t (*store)(struct exnfc_obj *data, struct exnfc_attribute *attr, const char *buf, size_t count);
+	ssize_t (*show)(struct flash_obj *obj, struct flash_attribute *attr, char *buf);
+	ssize_t (*store)(struct flash_obj *data, struct flash_attribute *attr, const char *buf, size_t count);
 };
-#define to_exnfc_attr(x) container_of(x, struct exnfc_attribute, attr)
+#define to_flash_attr(x) container_of(x, struct flash_attribute, attr)
 
-/* exnfc sysfs functions */
-struct exnfc_obj *create_exnfc_obj(int exnfc_id, int pid, const char *procname, int ifindex, int qid);
-void destroy_exnfc_obj(struct exnfc_obj *obj);
-int exnfc_sysfs_init(void);
+/* flash sysfs functions */
+struct flash_obj *create_flash_obj(int flash_id, int pid, const char *procname, int ifindex, int qid);
+void destroy_flash_obj(struct flash_obj *obj);
+int flash_sysfs_init(void);
 
 #endif /* _LINUX_XSK_SYSFS_H */

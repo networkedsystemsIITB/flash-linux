@@ -69,10 +69,12 @@ struct xsk_buff_pool {
 	dma_addr_t *dma_pages;
 	struct xdp_buff_xsk *heads;
 	struct xdp_desc *tx_descs;
-	struct xdp_desc *chain_tx_descs; // Batching exnfc
-	u32 n_chain_tx_descs;	// Batching tx num
-	struct xdp_buff **fq_buff_batch; // Batching exnfc
-	struct xdp_desc* fq_descs; // Batching exnfc
+	/* For enabling batching in flash */
+	struct xdp_desc *chain_tx_descs;
+	u32 n_chain_tx_descs;
+	struct xdp_buff **fq_buff_batch;
+	struct xdp_desc* fq_descs;
+
 	u64 chunk_mask;
 	u64 addrs_cnt;
 	u32 free_list_cnt;
@@ -111,7 +113,7 @@ int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
 int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_sock *umem_xs,
 			 struct net_device *dev, u16 queue_id);
 int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs);
-int xp_alloc_chain_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); // Batching exnfc
+int xp_alloc_chain_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); /* flash */
 void xp_destroy(struct xsk_buff_pool *pool);
 void xp_get_pool(struct xsk_buff_pool *pool);
 bool xp_put_pool(struct xsk_buff_pool *pool);

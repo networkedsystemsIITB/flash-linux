@@ -398,7 +398,7 @@ static bool ixgbe_xmit_zc(struct ixgbe_ring *xdp_ring, unsigned int budget)
 	dma_addr_t dma;
 	u32 cmd_type;
 	u32 memcpy_frames = 0;
-	// bool exnfc_flush = false; // only required in case of SPSC
+	// bool flash_flush = false; // only required in case of SPSC
 
 	while (budget-- > 0) {
 		if (unlikely(!ixgbe_desc_unused(xdp_ring))) {
@@ -412,10 +412,10 @@ static bool ixgbe_xmit_zc(struct ixgbe_ring *xdp_ring, unsigned int budget)
 		if (!xsk_tx_peek_desc(pool, &desc))
 			break;
 		
-		if (desc.options & EXNFC_NO_TX) {
-			if (desc.options & EXNFC_NO_TX_FLUSH)
+		if (desc.options & FLASH_NO_TX) {
+			if (desc.options & FLASH_NO_TX_FLUSH)
 				memcpy_frames++;
-			// exnfc_flush = true; // only required in case of SPSC
+			// flash_flush = true; // only required in case of SPSC
 			continue;
 		}
 
@@ -450,7 +450,7 @@ static bool ixgbe_xmit_zc(struct ixgbe_ring *xdp_ring, unsigned int budget)
 	}
 
 	// Only required in case of SPSC
-	// if (exnfc_flush)
+	// if (flash_flush)
 	// 	xdp_do_flush();
 
 	if (memcpy_frames) {

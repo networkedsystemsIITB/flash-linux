@@ -15,8 +15,8 @@
 #include <net/sock.h>
 
 #define XDP_UMEM_SG_FLAG (1 << 1)
-#define EXNFC_NO_TX (1 << 2) /* Don't transmit packet in driver */
-#define EXNFC_NO_TX_FLUSH (1 << 3) /* Don't transmit packet in driver but flush tx packets */
+#define FLASH_NO_TX (1 << 2) /* Don't transmit packet in driver */
+#define FLASH_NO_TX_FLUSH (1 << 3) /* Don't transmit packet in driver but flush tx packets */
 
 struct net_device;
 struct xsk_queue;
@@ -94,10 +94,10 @@ struct xdp_sock {
 	struct xsk_queue *fq_tmp; /* Only as tmp storage before bind */
 	struct xsk_queue *cq_tmp; /* Only as tmp storage before bind */
 
-	/* Socked ID that is used for socket chaining (exnfc) */
-	int exnfc_id;
-	/* pointer to exnfc_obj */
-	void *exnfc_object;
+	/* Socked ID that is used for socket chaining (flash) */
+	int flash_id;
+	/* pointer to flash_obj (flash) */
+	void *flash_object;
 };
 
 /*
