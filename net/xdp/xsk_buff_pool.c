@@ -36,6 +36,10 @@ void xp_destroy(struct xsk_buff_pool *pool)
 {
 	if (!pool)
 		return;
+	/* For batching in flash */
+	kvfree(pool->fq_buff_batch);
+	kvfree(pool->fq_descs);
+	kvfree(pool->chain_tx_descs);
 
 	kvfree(pool->tx_descs);
 	kvfree(pool->heads);
@@ -47,6 +51,17 @@ int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 	pool->tx_descs = kvcalloc(xs->tx->nentries, sizeof(*pool->tx_descs),
 				  GFP_KERNEL);
 	if (!pool->tx_descs)
+		return -ENOMEM;
+
+	return 0;
+}
+
+/* For batching in flash */
+int xp_alloc_chain_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
+{
+	pool->chain_tx_descs = kvcalloc(xs->tx->nentries, sizeof(*pool->chain_tx_descs),
+				  GFP_KERNEL);
+	if (!pool->chain_tx_descs)
 		return -ENOMEM;
 
 	return 0;
@@ -73,6 +88,18 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 		if (xp_alloc_tx_descs(pool, xs))
 			goto out;
 
+	/* For batching in flash */
+	if (xs->tx)
+		if (xp_alloc_chain_tx_descs(pool,xs))
+			goto out;
+		
+	pool->n_chain_tx_descs = 0;
+
+	xs->rx->n_rx_descs = 0; 
+	xs->rx->rx_descs = kvcalloc(xs->rx->nentries, sizeof(struct xdp_desc), GFP_KERNEL);
+	if(!xs->rx->rx_descs)
+		goto out;
+
 	pool->chunk_mask = ~((u64)umem->chunk_size - 1);
 	pool->addrs_cnt = umem->size;
 	pool->heads_cnt = umem->chunks;
@@ -96,6 +123,15 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 
 	pool->fq = xs->fq_tmp;
 	pool->cq = xs->cq_tmp;
+
+	/* For batching in flash */
+	pool->fq_buff_batch = kvcalloc(pool->fq->nentries, sizeof(struct xdp_buff *), GFP_KERNEL);
+	if (!pool->fq_buff_batch)
+		goto out;
+
+	pool->fq_descs = kvcalloc(pool->fq->nentries, sizeof(struct xdp_desc), GFP_KERNEL);
+	if (!pool->fq_descs)
+		goto out;
 
 	for (i = 0; i < pool->free_heads_cnt; i++) {
 		xskb = &pool->heads[i];
@@ -616,6 +652,11 @@ static u32 xp_alloc_new_from_fq(struct xsk_buff_pool *pool, struct xdp_buff **xd
 		} else {
 			xskb = &pool->heads[xp_aligned_extract_idx(pool, addr)];
 		}
+
+		/* For batching in flash */
+		xskb->xdp.data = xskb->xdp.data_hard_start + XDP_PACKET_HEADROOM;
+		xskb->xdp.data_meta = xskb->xdp.data;
+		xskb->xdp.flags = 0;
 
 		*xdp = &xskb->xdp;
 		xdp++;

@@ -8,7 +8,7 @@
 
 #include "xsk_sysfs.h"
 
-static struct kset *exnfc_kset = NULL;
+static struct kset *flash_kset = NULL;
 
 /*
  * The default show function that must be passed to sysfs.  This will be
@@ -17,13 +17,13 @@ static struct kset *exnfc_kset = NULL;
  * transpose back from a "default" kobject to our custom struct foo_obj and
  * then call the show function for that specific object.
  */
-static ssize_t exnfc_attr_show(struct kobject *kobj, struct attribute *attr, char *buf)
+static ssize_t flash_attr_show(struct kobject *kobj, struct attribute *attr, char *buf)
 {
-	struct exnfc_attribute *attribute;
-	struct exnfc_obj *obj;
+	struct flash_attribute *attribute;
+	struct flash_obj *obj;
 
-	attribute = to_exnfc_attr(attr);
-	obj = to_exnfc_obj(kobj);
+	attribute = to_flash_attr(attr);
+	obj = to_flash_obj(kobj);
 
 	if (!attribute->show)
 		return -EIO;
@@ -35,13 +35,13 @@ static ssize_t exnfc_attr_show(struct kobject *kobj, struct attribute *attr, cha
  * Just like the default show function above, but this one is for when the
  * sysfs "store" is requested (when a value is written to a file.)
  */
-static ssize_t exnfc_attr_store(struct kobject *kobj, struct attribute *attr, const char *buf, size_t len)
+static ssize_t flash_attr_store(struct kobject *kobj, struct attribute *attr, const char *buf, size_t len)
 {
-	struct exnfc_attribute *attribute;
-	struct exnfc_obj *obj;
+	struct flash_attribute *attribute;
+	struct flash_obj *obj;
 
-	attribute = to_exnfc_attr(attr);
-	obj = to_exnfc_obj(kobj);
+	attribute = to_flash_attr(attr);
+	obj = to_flash_obj(kobj);
 
 	if (!attribute->store)
 		return -EIO;
@@ -50,40 +50,40 @@ static ssize_t exnfc_attr_store(struct kobject *kobj, struct attribute *attr, co
 }
 
 /* Our custom sysfs_ops that we will associate with our ktype later on */
-static const struct sysfs_ops exnfc_sysfs_ops = {
-	.show = exnfc_attr_show,
-	.store = exnfc_attr_store,
+static const struct sysfs_ops flash_sysfs_ops = {
+	.show = flash_attr_show,
+	.store = flash_attr_store,
 };
 
 /*
  * The release function for our object.  This is REQUIRED by the kernel to
  * have.  We free the memory held in our object here.
  */
-static void exnfc_release(struct kobject *kobj)
+static void flash_release(struct kobject *kobj)
 {
-	struct exnfc_obj *obj;
+	struct flash_obj *obj;
 
-	obj = to_exnfc_obj(kobj);
+	obj = to_flash_obj(kobj);
 	kfree(obj);
 }
 
 /*
  * This for the "procname" file where the .procname variable is read only file.
  */
-static ssize_t ro_buffer_show(struct exnfc_obj *obj, struct exnfc_attribute *attr, char *buf)
+static ssize_t ro_buffer_show(struct flash_obj *obj, struct flash_attribute *attr, char *buf)
 {
     return sysfs_emit(buf, "%s\n", obj->procname);
 }
 
 /* Sysfs attributes cannot be world-writable. */
-static struct exnfc_attribute proc_attribute = __ATTR(procname, 0444, ro_buffer_show, NULL);
+static struct flash_attribute proc_attribute = __ATTR(procname, 0444, ro_buffer_show, NULL);
 
 /*
  * More complex function where we determine which variable is being accessed by
  * looking at the attribute for the "pid", "ifindex" and "queue_id" files.
  * All of them are read only files
  */
-static ssize_t ro_int_show(struct exnfc_obj *obj, struct exnfc_attribute *attr, char *buf)
+static ssize_t ro_int_show(struct flash_obj *obj, struct flash_attribute *attr, char *buf)
 {
     int var;
 
@@ -96,19 +96,19 @@ static ssize_t ro_int_show(struct exnfc_obj *obj, struct exnfc_attribute *attr, 
     return sysfs_emit(buf, "%d\n", var);
 }
 
-static struct exnfc_attribute pid_attribute = __ATTR(pid, 0444, ro_int_show, NULL);
-static struct exnfc_attribute ifindex_attribute = __ATTR(ifindex, 0444, ro_int_show, NULL);
-static struct exnfc_attribute qid_attribute = __ATTR(qid, 0444, ro_int_show, NULL);
+static struct flash_attribute pid_attribute = __ATTR(pid, 0444, ro_int_show, NULL);
+static struct flash_attribute ifindex_attribute = __ATTR(ifindex, 0444, ro_int_show, NULL);
+static struct flash_attribute qid_attribute = __ATTR(qid, 0444, ro_int_show, NULL);
 
 /*
  * The "next" file where the .next variable is read from and written to.
  */
-static ssize_t rw_int_show(struct exnfc_obj *obj, struct exnfc_attribute *attr, char *buf)
+static ssize_t rw_int_show(struct flash_obj *obj, struct flash_attribute *attr, char *buf)
 {
 	return sysfs_emit(buf, "%d\n", obj->next);
 }
 
-static ssize_t rw_int_store(struct exnfc_obj *obj, struct exnfc_attribute *attr, const char *buf, size_t count)
+static ssize_t rw_int_store(struct flash_obj *obj, struct flash_attribute *attr, const char *buf, size_t count)
 {
 	int ret;
     int current_id;
@@ -121,7 +121,7 @@ static ssize_t rw_int_store(struct exnfc_obj *obj, struct exnfc_attribute *attr,
     if (ret < 0)
         return ret;
 
-    ret = exnfc_update_chain_map(current_id, obj->next);
+    ret = flash_update_chain_map(current_id, obj->next);
     if (ret < 0) {
         obj->next = -1;
         return ret;
@@ -131,13 +131,13 @@ static ssize_t rw_int_store(struct exnfc_obj *obj, struct exnfc_attribute *attr,
 }
 
 /* Sysfs attributes cannot be world-writable. */
-static struct exnfc_attribute next_attribute = __ATTR(next, 0644, rw_int_show, rw_int_store);
+static struct flash_attribute next_attribute = __ATTR(next, 0644, rw_int_show, rw_int_store);
 
 /*
  * Create a group of attributes so that we can create and destroy them all
  * at once.
  */
-static struct attribute *exnfc_default_attrs[] = {
+static struct attribute *flash_default_attrs[] = {
 	&pid_attribute.attr,
     &proc_attribute.attr,
 	&ifindex_attribute.attr,
@@ -145,26 +145,26 @@ static struct attribute *exnfc_default_attrs[] = {
     &next_attribute.attr,
 	NULL,	/* need to NULL terminate the list of attributes */
 };
-ATTRIBUTE_GROUPS(exnfc_default);
+ATTRIBUTE_GROUPS(flash_default);
 
 /*
  * Our own ktype for our kobjects.  Here we specify our sysfs ops, the
  * release function, and the set of default attributes we want created
  * whenever a kobject of this type is registered with the kernel.
  */
-static const struct kobj_type exnfc_ktype = {
-	.sysfs_ops = &exnfc_sysfs_ops,
-	.release = exnfc_release,
-	.default_groups = exnfc_default_groups,
+static const struct kobj_type flash_ktype = {
+	.sysfs_ops = &flash_sysfs_ops,
+	.release = flash_release,
+	.default_groups = flash_default_groups,
 };
 
-struct exnfc_obj *create_exnfc_obj(int exnfc_id, int pid, const char *procname, int ifindex, int qid)
+struct flash_obj *create_flash_obj(int flash_id, int pid, const char *procname, int ifindex, int qid)
 {
-    struct exnfc_obj *obj;
+    struct flash_obj *obj;
     int retval;
-    char exnfc_name[12];
+    char flash_name[12];
 
-    snprintf(exnfc_name, sizeof(exnfc_name), "%d", exnfc_id);
+    snprintf(flash_name, sizeof(flash_name), "%d", flash_id);
 
     /* allocate the memory for the whole object */
     obj = kzalloc(sizeof(*obj), GFP_KERNEL);
@@ -175,7 +175,7 @@ struct exnfc_obj *create_exnfc_obj(int exnfc_id, int pid, const char *procname, 
      * As we have a kset for this kobject, we need to set it before calling
      * the kobject core.
      */
-    obj->kobj.kset = exnfc_kset;
+    obj->kobj.kset = flash_kset;
 
     /*
      * Initialize the object's fields
@@ -193,7 +193,7 @@ struct exnfc_obj *create_exnfc_obj(int exnfc_id, int pid, const char *procname, 
      * will be placed beneath that kset automatically.
      */
 
-    retval = kobject_init_and_add(&obj->kobj, &exnfc_ktype, NULL, "%s", exnfc_name);
+    retval = kobject_init_and_add(&obj->kobj, &flash_ktype, NULL, "%s", flash_name);
     if (retval) {
         kfree(obj);
         return NULL;
@@ -208,7 +208,7 @@ struct exnfc_obj *create_exnfc_obj(int exnfc_id, int pid, const char *procname, 
     return obj;
 }
 
-void destroy_exnfc_obj(struct exnfc_obj *obj)
+void destroy_flash_obj(struct flash_obj *obj)
 {
     kobject_put(&obj->kobj);
 }
@@ -216,14 +216,14 @@ void destroy_exnfc_obj(struct exnfc_obj *obj)
 /*
  * @brief The moudule entry that sets up the sysfs directory
  */
-int exnfc_sysfs_init(void)
+int flash_sysfs_init(void)
 {
     /*
-     * Create a kset with the name of "exnfc",
+     * Create a kset with the name of "flash",
      * located under /sys/kernel/
      */
-    exnfc_kset = kset_create_and_add("exnfc", NULL, kernel_kobj);
-    if (!exnfc_kset)
+    flash_kset = kset_create_and_add("flash", NULL, kernel_kobj);
+    if (!flash_kset)
         return ENOMEM;
 
     return 0;
@@ -233,7 +233,7 @@ int exnfc_sysfs_init(void)
  * @brief The exit point
  * In kernel this should not be present. Right?
  */
-// static void exnfc_exit(void)
+// static void flash_exit(void)
 // {
-//     kset_unregister(exnfc_kset);
+//     kset_unregister(flash_kset);
 // }
