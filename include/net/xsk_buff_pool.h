@@ -74,6 +74,7 @@ struct xsk_buff_pool {
 	u32 n_chain_tx_descs;
 	struct xdp_buff **fq_buff_batch;
 	struct xdp_desc* fq_descs;
+	u32 n_chain_fq_descs;
 
 	u64 chunk_mask;
 	u64 addrs_cnt;

@@ -133,6 +133,8 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	if (!pool->fq_descs)
 		goto out;
 
+	pool->n_chain_fq_descs = 0;
+
 	for (i = 0; i < pool->free_heads_cnt; i++) {
 		xskb = &pool->heads[i];
 		xskb->pool = pool;

@@ -602,7 +602,7 @@ static inline int xskq_enqueue_rxtx(struct xsk_queue *q, u64 addr, u32 len, u32 
 	return 0;
 }
 
-static inline int xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* descs, u32 n_descs)
+static inline u32 xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* descs, u32 n_descs)
 {	
 	u32 prod_head;
 	u32 prod_next;
@@ -613,19 +613,36 @@ static inline int xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* d
 
 	/* Ring full */
 	if(n == 0) 
-		return -ENOBUFS;
+		return 0;
 
 	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
 	
 	idx = prod_head & q->ring_mask;
-	for(u32 i = 0; i < n; i++){
+	for(u32 i = 0; i < n; i++) {
 		ring->desc[idx] = descs[i];
 		idx = ((idx + 1) & q->ring_mask);
 	}
 
 	xskq_update_prod_tail((struct xdp_ring *)ring, prod_head, prod_next);
 
-	return 0;
+	return n;
+}
+
+static inline void xskq_bulk_submit_rxtx(struct xsk_queue *q, struct xdp_desc* descs, u32 prod_head, u32 prod_next, u32 n_descs)
+{
+	u32 idx;
+
+	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
+	
+	idx = prod_head & q->ring_mask;
+	for(u32 i = 0; i < n_descs; i++) {
+		ring->desc[idx] = descs[i];
+		idx = ((idx + 1) & q->ring_mask);
+	}
+
+	xskq_update_prod_tail((struct xdp_ring *)ring, prod_head, prod_next);
+
+	return;
 }
 
 static inline int xskq_enqueue_umem(struct xsk_queue *q, u64 addr)
