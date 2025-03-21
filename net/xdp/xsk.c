@@ -469,6 +469,8 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 	list_for_each_entry_rcu(xs, &pool->xsk_tx_list, tx_list) {
 		/* Batching tx */
 		if (list_is_singular(&pool->xsk_tx_list) && xs_chain[xs->flash_id]) {
+			pool->cq->cached_prod -= pool->n_cq_reserved;
+			pool->n_cq_reserved = 0;
 			u32 cq_submit = 0;
 			for (u32 outflow = 0; outflow < pool->n_out_buffs; outflow++) {
 				struct chain_out_buff *out_buff = &pool->out_buffs[outflow];
@@ -484,7 +486,7 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 					xs->tx->cached_cons -= tx_entries;
 					if(pool->n_out_buffs > 1)
 						xsk_tx_refill(xs->tx, out_buff->chain_tx_descs, xs->tx->cached_cons, tx_entries);
-					pool->cq->cached_prod -= tx_entries;
+					// pool->cq->cached_prod -= tx_entries;
 					out_buff->n_chain_tx_descs = 0;
 					continue;
 				}
@@ -501,7 +503,7 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 					xs->tx->cached_cons -= tx_entries;
 					if(pool->n_out_buffs > 1)
 						xsk_tx_refill(xs->tx, out_buff->chain_tx_descs, xs->tx->cached_cons, tx_entries);
-					pool->cq->cached_prod -= tx_entries;
+					// pool->cq->cached_prod -= tx_entries;
 					out_buff->n_chain_tx_descs = 0;
 					continue;
 				}
@@ -534,7 +536,7 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 						xskq_bulk_submit_rxtx(flash_xs->rx, out_buff->chain_tx_descs, prod_head, prod_next, rx_entries);
 
 					/* Add chain_fq_descs of next socket to cq */
-					pool->cq->cached_prod -= tx_entries;
+					// pool->cq->cached_prod -= tx_entries;
 					xskq_prod_write_addr_batch(pool->cq, chain_fq_descs + out_buff->n_chain_fq_descs - rx_entries, rx_entries);
 				} else {
 					/* memcpy magic - MPSC required */
@@ -580,8 +582,8 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 						xskq_bulk_submit_rxtx(flash_xs->rx, chain_fq_descs + out_buff->n_chain_fq_descs - rx_entries, prod_head, prod_next, rx_entries);
 
 					/* Add tx_descs to cq */
-					pool->cq->cached_prod -= tx_entries;
-					xskq_prod_write_addr_batch(pool->cq, out_buff->chain_tx_descs,rx_entries);
+					// pool->cq->cached_prod -= tx_entries;
+					xskq_prod_write_addr_batch(pool->cq, out_buff->chain_tx_descs, rx_entries);
 				}
 
 				/* TX update */
@@ -656,6 +658,7 @@ again:
 			/* Back Pressure */
 			if (xskq_prod_reserve(pool->cq))
 				goto out;
+			pool->n_cq_reserved++;
 
 			struct chain_out_buff *out_buff = &pool->out_buffs[out_id];
 

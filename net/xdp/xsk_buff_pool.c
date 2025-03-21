@@ -149,6 +149,7 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	/* For batching in flash */
 	pool->n_out_buffs = 0;
 	pool->out_buffs = NULL;
+	pool->n_cq_reserved = 0;
 
 	xs->rx->n_rx_descs = 0; 
 	xs->rx->rx_descs = kvcalloc(xs->rx->nentries, sizeof(struct xdp_desc), GFP_KERNEL);

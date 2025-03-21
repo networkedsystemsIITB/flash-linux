@@ -81,6 +81,7 @@ struct xsk_buff_pool {
 	struct chain_out_buff* out_buffs;
 	u32 n_out_buffs;
 	struct xdp_buff **fq_buff_batch;
+	u32 n_cq_reserved;
 
 	u64 chunk_mask;
 	u64 addrs_cnt;
