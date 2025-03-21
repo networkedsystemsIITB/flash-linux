@@ -22,7 +22,8 @@ struct flash_obj {
     char procname[16];
     int ifindex;
     int qid;
-    int next;
+    int *next;
+    int next_count;
 };
 #define to_flash_obj(x) container_of(x, struct flash_obj, kobj)
 

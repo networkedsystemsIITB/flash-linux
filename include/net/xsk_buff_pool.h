@@ -20,6 +20,14 @@ struct xdp_sock;
 struct device;
 struct page;
 
+struct chain_out_buff{
+	struct xdp_desc *chain_tx_descs;
+	u32 n_chain_tx_descs;
+	struct xdp_desc* chain_fq_descs;
+	u32 n_chain_fq_descs;
+	int dst_flash_id;
+};
+
 #define XSK_PRIV_MAX 24
 
 struct xdp_buff_xsk {
@@ -70,11 +78,9 @@ struct xsk_buff_pool {
 	struct xdp_buff_xsk *heads;
 	struct xdp_desc *tx_descs;
 	/* For enabling batching in flash */
-	struct xdp_desc *chain_tx_descs;
-	u32 n_chain_tx_descs;
+	struct chain_out_buff* out_buffs;
+	u32 n_out_buffs;
 	struct xdp_buff **fq_buff_batch;
-	struct xdp_desc* fq_descs;
-	u32 n_chain_fq_descs;
 
 	u64 chunk_mask;
 	u64 addrs_cnt;
@@ -115,6 +121,9 @@ int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_sock *umem_xs,
 			 struct net_device *dev, u16 queue_id);
 int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs);
 int xp_alloc_chain_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); /* flash */
+int xp_alloc_chain_fq_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); /* flash */
+int alloc_out_buffs(struct xdp_sock *xs, int *next_id, int n); /* flash */
+void destroy_out_buffs(struct xsk_buff_pool *pool); /* flash */
 void xp_destroy(struct xsk_buff_pool *pool);
 void xp_get_pool(struct xsk_buff_pool *pool);
 bool xp_put_pool(struct xsk_buff_pool *pool);
