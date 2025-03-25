@@ -486,7 +486,7 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 					xs->tx->cached_cons -= tx_entries;
 					if(pool->n_out_buffs > 1)
 						xsk_tx_refill(xs->tx, out_buff->chain_tx_descs, xs->tx->cached_cons, tx_entries);
-					// pool->cq->cached_prod -= tx_entries;
+
 					out_buff->n_chain_tx_descs = 0;
 					continue;
 				}
@@ -503,7 +503,7 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 					xs->tx->cached_cons -= tx_entries;
 					if(pool->n_out_buffs > 1)
 						xsk_tx_refill(xs->tx, out_buff->chain_tx_descs, xs->tx->cached_cons, tx_entries);
-					// pool->cq->cached_prod -= tx_entries;
+
 					out_buff->n_chain_tx_descs = 0;
 					continue;
 				}
@@ -536,16 +536,15 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 						xskq_bulk_submit_rxtx(flash_xs->rx, out_buff->chain_tx_descs, prod_head, prod_next, rx_entries);
 
 					/* Add chain_fq_descs of next socket to cq */
-					// pool->cq->cached_prod -= tx_entries;
 					xskq_prod_write_addr_batch(pool->cq, chain_fq_descs + out_buff->n_chain_fq_descs - rx_entries, rx_entries);
+					sock_def_readable(&flash_xs->sk);
 				} else {
 					/* memcpy magic - MPSC required */
 					if (unlikely(!xsk_is_bound(flash_xs))) {
-						pr_warn("flash socket is not bound\n");
 						xs->tx->cached_cons -= tx_entries;
 						if(pool->n_out_buffs > 1)
 							xsk_tx_refill(xs->tx, out_buff->chain_tx_descs, xs->tx->cached_cons, tx_entries);
-						pool->cq->cached_prod -= tx_entries;
+
 						out_buff->n_chain_tx_descs = 0;
 						continue;
 					}
@@ -582,19 +581,21 @@ void xsk_tx_release(struct xsk_buff_pool *pool)
 						xskq_bulk_submit_rxtx(flash_xs->rx, chain_fq_descs + out_buff->n_chain_fq_descs - rx_entries, prod_head, prod_next, rx_entries);
 
 					/* Add tx_descs to cq */
-					// pool->cq->cached_prod -= tx_entries;
 					xskq_prod_write_addr_batch(pool->cq, out_buff->chain_tx_descs, rx_entries);
+					sock_def_readable(&flash_xs->sk);
 				}
 
 				/* TX update */
 				xs->tx->cached_cons -= (tx_entries - rx_entries);
 				if(pool->n_out_buffs > 1)
 					xsk_tx_refill(xs->tx, &out_buff->chain_tx_descs[rx_entries], xs->tx->cached_cons, tx_entries - rx_entries);
+
 				out_buff->n_chain_tx_descs = 0;
 
 				out_buff->n_chain_fq_descs -= rx_entries;
 				cq_submit += rx_entries;
 			}
+			
 			__xskq_cons_release(xs->tx);
 			if (xsk_tx_writeable(xs))
 				xs->sk.sk_write_space(&xs->sk);
@@ -658,6 +659,7 @@ again:
 			/* Back Pressure */
 			if (xskq_prod_reserve(pool->cq))
 				goto out;
+
 			pool->n_cq_reserved++;
 
 			struct chain_out_buff *out_buff = &pool->out_buffs[out_id];
