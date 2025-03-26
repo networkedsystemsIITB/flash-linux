@@ -20,12 +20,13 @@ struct xdp_sock;
 struct device;
 struct page;
 
+/* Buffer corresponding each outflow on a NF */
 struct chain_out_buff{
 	struct xdp_desc *chain_tx_descs;
 	u32 n_chain_tx_descs;
 	struct xdp_desc* chain_fq_descs;
 	u32 n_chain_fq_descs;
-	int dst_flash_id;
+	int dst_flash_id;	// Flash ID of destination NF
 };
 
 #define XSK_PRIV_MAX 24
@@ -77,11 +78,13 @@ struct xsk_buff_pool {
 	dma_addr_t *dma_pages;
 	struct xdp_buff_xsk *heads;
 	struct xdp_desc *tx_descs;
+
 	/* For enabling batching in flash */
-	struct chain_out_buff* out_buffs;
-	u32 n_out_buffs;
-	struct xdp_buff **fq_buff_batch;
-	u32 n_cq_reserved;
+	struct chain_out_buff* out_buffs;	// Array of out buffers
+	u32 n_out_buffs;					
+	struct xdp_buff **fq_buff_batch;	// Temp storage for fq buffers
+	u32 n_cq_reserved;					// No. of descs reserved in CQ
+	bool no_tx_out;						// Flag to prevent driver sending packet out
 
 	u64 chunk_mask;
 	u64 addrs_cnt;

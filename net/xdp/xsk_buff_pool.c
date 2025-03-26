@@ -71,6 +71,7 @@ int xp_alloc_chain_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 	return 0;
 }
 
+/* For batching in flash */
 int xp_alloc_chain_fq_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 {	
 	for (int i = 0; i < pool->n_out_buffs; i++) {
@@ -85,6 +86,7 @@ int xp_alloc_chain_fq_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 	return 0;
 }
 
+/* For batching in flash */
 void destroy_out_buffs(struct xsk_buff_pool *pool)
 {
 	if (pool->n_out_buffs > 0) {
@@ -98,6 +100,7 @@ void destroy_out_buffs(struct xsk_buff_pool *pool)
 	}
 }
 
+/* For batching in flash */
 int alloc_out_buffs(struct xdp_sock *xs, int* next_id, int n) 
 {
 	struct xsk_buff_pool *pool = xs->pool;
@@ -150,6 +153,7 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	pool->n_out_buffs = 0;
 	pool->out_buffs = NULL;
 	pool->n_cq_reserved = 0;
+	pool->no_tx_out = false;
 
 	xs->rx->n_rx_descs = 0; 
 	xs->rx->rx_descs = kvcalloc(xs->rx->nentries, sizeof(struct xdp_desc), GFP_KERNEL);

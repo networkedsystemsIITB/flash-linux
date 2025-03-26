@@ -1092,6 +1092,9 @@ bool ice_xmit_zc(struct ice_tx_ring *xdp_ring, struct xsk_buff_pool *xsk_pool)
 	if (!nb_pkts)
 		return true;
 
+	if (xsk_pool->no_tx_out)
+		return nb_pkts < budget;
+
 	if (xdp_ring->next_to_use + nb_pkts >= xdp_ring->count) {
 		nb_processed = xdp_ring->count - xdp_ring->next_to_use;
 		ice_fill_tx_hw_ring(xdp_ring, xsk_pool, descs, nb_processed,

@@ -608,6 +608,9 @@ static bool i40e_xmit_zc(struct i40e_ring *xdp_ring, unsigned int budget)
 	if (!nb_pkts)
 		return true;
 
+	if (xdp_ring->xsk_pool->no_tx_out)
+		return nb_pkts < budget;
+
 	if (xdp_ring->next_to_use + nb_pkts >= xdp_ring->count) {
 		nb_processed = xdp_ring->count - xdp_ring->next_to_use;
 		i40e_fill_tx_hw_ring(xdp_ring, descs, nb_processed, &total_bytes);

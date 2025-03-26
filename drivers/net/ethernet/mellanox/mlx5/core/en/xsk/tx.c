@@ -68,7 +68,6 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 	union mlx5e_xdp_info xdpi;
 	bool work_done = true;
 	bool flush = false;
-	bool flash_release = false;
 
 	xdpi.mode = MLX5E_XDP_XMIT_MODE_XSK;
 
@@ -95,10 +94,8 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 			break;
 		}
 
-		if (desc.options & FLASH_NO_TX) {
-			flash_release = true;
+		if (pool->no_tx_out)
 			continue;
-		}
 
 		xdptxd.dma_addr = xsk_buff_raw_get_dma(pool, desc.addr);
 		xdptxd.data = xsk_buff_raw_get_data(pool, desc.addr);
@@ -132,7 +129,7 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
 		flush = true;
 	}
 
-	if (flush || flash_release) {
+	if (flush || pool->no_tx_out) {
 		if (sq->mpwqe.wqe)
 			mlx5e_xdp_mpwqe_complete(sq);
 		mlx5e_xmit_xdp_doorbell(sq);
