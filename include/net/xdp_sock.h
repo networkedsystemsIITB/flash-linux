@@ -15,8 +15,6 @@
 #include <net/sock.h>
 
 #define XDP_UMEM_SG_FLAG (1 << 1)
-#define FLASH_NO_TX (1 << 2) /* Don't transmit packet in driver */
-#define FLASH_NO_TX_FLUSH (1 << 3) /* Don't transmit packet in driver but flush tx packets */
 
 struct net_device;
 struct xsk_queue;

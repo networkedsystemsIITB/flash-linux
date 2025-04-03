@@ -49,7 +49,7 @@ struct xsk_queue {
 	u32 cached_cons;
 	struct xdp_ring *ring;
 	struct xdp_desc *rx_descs; /* For rx batching in flash */
-	u32 n_rx_descs; /* For rx batching in flash */
+	u32 n_rx_descs; 		   /* For rx batching in flash */
 	u64 invalid_descs;
 	u64 queue_empty_descs;
 	size_t ring_vmalloc_size;
@@ -144,7 +144,8 @@ static inline bool xskq_cons_read_addr_unchecked(struct xsk_queue *q, u64 *addr)
 
 static inline bool xp_unused_options_set(u32 options)
 {
-	return options & ~(XDP_PKT_CONTD | XDP_TX_METADATA);
+	// Check only lower 16 bits
+	return (options & 0xFFFF) & ~(XDP_PKT_CONTD | XDP_TX_METADATA);
 }
 
 static inline bool xp_aligned_validate_desc(struct xsk_buff_pool *pool,
@@ -279,6 +280,55 @@ u32 xskq_cons_read_desc_batch(struct xsk_queue *q, struct xsk_buff_pool *pool,
 	/* Release valid plus any invalid entries */
 	xskq_cons_release_n(q, cached_cons - q->cached_cons);
 	return total_descs;
+}
+
+/* Returns extracted outflow index from desc options */
+static inline int get_outflow(struct xdp_desc *desc, struct xsk_buff_pool *pool)
+{	
+	if(unlikely(!pool->out_buffs))
+		return -1;
+	if(pool->n_out_buffs == 1)
+		return 0;
+
+	int next_id = (int)(desc->options >> 16);
+
+	return next_id;
+}
+
+/* Consumes max no. of descs from tx ring and stores in out_buffs */
+static inline
+u32 xskq_cons_read_desc_batch_chain(struct xsk_queue *q, struct xsk_buff_pool *pool,
+			      u32 max)
+{
+	u32 cached_cons = q->cached_cons, nb_entries = 0;
+	
+	while (cached_cons != q->cached_prod && nb_entries < max) {
+		struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
+		u32 idx = cached_cons & q->ring_mask;
+		struct parsed_desc parsed;
+		struct xdp_desc* desc = &ring->desc[idx];
+
+		int out_id = get_outflow(desc, pool);
+		cached_cons++;
+		if(unlikely(out_id < 0 || out_id >= pool->n_out_buffs)) {
+			q->invalid_descs++;
+			break;
+		}
+
+		parse_desc(q, pool, desc, &parsed);
+		if (unlikely(!parsed.valid))
+			break;
+
+		struct chain_out_buff *out_buff = &pool->out_buffs[out_id];
+		out_buff->chain_tx_descs[out_buff->n_chain_tx_descs] = *desc;
+		out_buff->n_chain_tx_descs++;
+		
+		nb_entries++;
+	}
+
+	/* Release valid plus any invalid entries */
+	xskq_cons_release_n(q, cached_cons - q->cached_cons);
+	return nb_entries;
 }
 
 /* Functions for consumers */
@@ -602,7 +652,7 @@ static inline int xskq_enqueue_rxtx(struct xsk_queue *q, u64 addr, u32 len, u32 
 	return 0;
 }
 
-static inline int xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* descs, u32 n_descs)
+static inline u32 xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* descs, u32 n_descs)
 {	
 	u32 prod_head;
 	u32 prod_next;
@@ -613,19 +663,36 @@ static inline int xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* d
 
 	/* Ring full */
 	if(n == 0) 
-		return -ENOBUFS;
+		return 0;
 
 	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
 	
 	idx = prod_head & q->ring_mask;
-	for(u32 i = 0; i < n; i++){
+	for(u32 i = 0; i < n; i++) {
 		ring->desc[idx] = descs[i];
 		idx = ((idx + 1) & q->ring_mask);
 	}
 
 	xskq_update_prod_tail((struct xdp_ring *)ring, prod_head, prod_next);
 
-	return 0;
+	return n;
+}
+
+static inline void xskq_bulk_submit_rxtx(struct xsk_queue *q, struct xdp_desc* descs, u32 prod_head, u32 prod_next, u32 n_descs)
+{
+	u32 idx;
+
+	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
+	
+	idx = prod_head & q->ring_mask;
+	for(u32 i = 0; i < n_descs; i++) {
+		ring->desc[idx] = descs[i];
+		idx = ((idx + 1) & q->ring_mask);
+	}
+
+	xskq_update_prod_tail((struct xdp_ring *)ring, prod_head, prod_next);
+
+	return;
 }
 
 static inline int xskq_enqueue_umem(struct xsk_queue *q, u64 addr)

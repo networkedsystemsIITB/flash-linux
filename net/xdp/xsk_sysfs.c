@@ -105,29 +105,95 @@ static struct flash_attribute qid_attribute = __ATTR(qid, 0444, ro_int_show, NUL
  */
 static ssize_t rw_int_show(struct flash_obj *obj, struct flash_attribute *attr, char *buf)
 {
-	return sysfs_emit(buf, "%d\n", obj->next);
+    ssize_t len = 0;
+    if (obj->next_count == 0){
+        return sysfs_emit(buf, "-1\n");
+    } else {
+        if (obj->next == NULL)
+            return sysfs_emit(buf, "Something went wrong\n");
+
+        len += sysfs_emit_at(buf, len, "index\tflash_id\n");
+        
+        for (int i = 0; i < obj->next_count; i++)
+            len += sysfs_emit_at(buf, len, "%d\t%d\n", i, obj->next[i]);
+            
+        return len;
+    }
 }
 
 static ssize_t rw_int_store(struct flash_obj *obj, struct flash_attribute *attr, const char *buf, size_t count)
 {
-	int ret;
-    int current_id;
-
-	ret = kstrtoint(buf, 10, &obj->next);
-	if (ret < 0)
-		return ret;
+    int ret, next, current_id;
+    int i = 0;
+    int next_count = 0;
+    int *next_ids;
+    const char *p = buf;
+    char temp[16];
 
     ret = kstrtoint(obj->kobj.name, 10, &current_id);
     if (ret < 0)
         return ret;
 
-    ret = flash_update_chain_map(current_id, obj->next);
-    if (ret < 0) {
-        obj->next = -1;
-        return ret;
+    /* Count number of next entries */
+    while (*p) {
+        while (*p && *p != ' ') {
+            p++;
+        }
+        next_count++;
+        // Skip any spaces
+        while (*p == ' ')
+            p++;
+    }
+    if (next_count == 0)
+        return -EINVAL;
+
+    next_ids = kvzalloc(next_count * sizeof(int), GFP_KERNEL);
+    if (!next_ids)
+        return -ENOMEM;
+
+    p = buf;
+    i = 0;
+    while (*p) {
+        // Copy the substring to the temporary buffer
+        int len = 0;
+        while (*p && *p != ' ' && len < sizeof(temp) - 1) {
+            temp[len++] = *p++;
+        }
+        temp[len] = '\0'; // Null-terminate the substring
+
+        // Convert the substring to an integer
+        ret = kstrtoint(temp, 10, &next);
+        if (ret < 0)
+            goto out;
+
+        printk("Next: %d\n", next);
+        next_ids[i++] = next;
+
+        // Skip any spaces
+        while (*p == ' ')
+            p++;
     }
 
-	return count;
+    ret = flash_update_chain_map(current_id, next_ids, next_count);
+    if (ret < 0) {
+        goto out;
+    } else if (ret == 1){
+        obj->next_count = 0;
+        kvfree(obj->next);
+        kvfree(next_ids);
+        return count;
+    }
+
+    obj->next_count = next_count;
+    if (!obj->next)
+        kvfree(obj->next);
+    obj->next = next_ids;
+
+    return count;
+
+out:
+    kvfree(next_ids);
+    return ret;
 }
 
 /* Sysfs attributes cannot be world-writable. */
@@ -183,7 +249,8 @@ struct flash_obj *create_flash_obj(int flash_id, int pid, const char *procname, 
     obj->pid = pid;
     obj->ifindex = ifindex;
     obj->qid = qid;
-    obj->next = -1;
+    obj->next = NULL;
+    obj->next_count = 0;
     strcpy(obj->procname, procname);
 
     /*
@@ -214,7 +281,7 @@ void destroy_flash_obj(struct flash_obj *obj)
 }
 
 /*
- * @brief The moudule entry that sets up the sysfs directory
+ * @brief The module entry that sets up the sysfs directory
  */
 int flash_sysfs_init(void)
 {

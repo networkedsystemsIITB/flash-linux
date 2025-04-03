@@ -41,12 +41,18 @@
 static DEFINE_PER_CPU(struct list_head, xskmap_flush_list);
 static DEFINE_IDR(flash_idr); /* IDR allocation (flash) */
 
-/* Lock to protect idr acceses (flash) */
+/* Lock to protect idr accesses (flash) */
 static DEFINE_SPINLOCK(flash_idr_lock);
 
 /* flash XSK map - Only use atomic operation for r/w operation - [TODO: 2D Maps] */
-static struct xdp_sock *flash_xsk_map[FLASH_MAX_XSK] = {NULL};
+// static struct xdp_sock *flash_xsk_map[FLASH_MAX_XSK] = {NULL};
 
+/* Cache for getting socket pointer using flash_id */
+static struct xdp_sock *cache_xs[FLASH_MAX_XSK] = {NULL};
+/* Chaining flags:
+true => socket's output goes to next NF, 
+false => socket's output goes out to NIC */
+static bool xs_chain[FLASH_MAX_XSK] = {0};
 
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
 {
@@ -356,9 +362,9 @@ static void xsk_flush(struct xdp_sock *xs)
 	// __xskq_cons_release(xs->pool->fq);
 
 	/* Batching Rx */
-	int err;
-	err = xskq_bulk_enqueue_rxtx(xs->rx, xs->rx->rx_descs, xs->rx->n_rx_descs);
-	if (err) {
+	u32 num;
+	num = xskq_bulk_enqueue_rxtx(xs->rx, xs->rx->rx_descs, xs->rx->n_rx_descs);
+	if (unlikely(!num)) {
 		xs->rx_queue_full++;
 		xs->rx->n_rx_descs = 0;
 		return;
@@ -447,110 +453,176 @@ void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries)
 }
 EXPORT_SYMBOL(xsk_tx_completed);
 
+/* Refills tx ring starting at start_idx with num amount of descs */
+static void xsk_tx_refill(struct xsk_queue *tx, struct xdp_desc *descs, u32 start_idx, u32 num)
+{
+	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)tx->ring;
+	u32 idx = start_idx & tx->ring_mask;
+	for (u32 i = 0; i < num; i++) {
+		ring->desc[idx] = descs[i];
+		idx = ((idx + 1) & tx->ring_mask);
+	}
+}
+
 void xsk_tx_release(struct xsk_buff_pool *pool)
 {
 	struct xdp_sock *xs;
-	int err;
 	struct xdp_sock *flash_xs; /* Next socket to send (flash) */
 
 	rcu_read_lock();
 	list_for_each_entry_rcu(xs, &pool->xsk_tx_list, tx_list) {
+		if (list_is_singular(&pool->xsk_tx_list) && xs_chain[xs->flash_id]) {
+			/* FLASH Path */
+
+			/* Reset CQ cached_prod */
+			xskq_prod_cancel_n(pool->cq, pool->n_cq_reserved);
+			pool->n_cq_reserved = 0;
+			u32 cq_submit = 0;
+			
+			/* Process each outflow */
+			for (u32 outflow = 0; outflow < pool->n_out_buffs; outflow++) {
+				struct chain_out_buff *out_buff = &pool->out_buffs[outflow];
+				// Leftover FQ descs from previous iterations
+				u32 avl_fq_entries = out_buff->n_chain_fq_descs;	
+				// Stores no. of descs consumed from tx
+				u32 tx_entries = out_buff->n_chain_tx_descs;
+				// Stores no. of FQ descs that can be used in current iteration
+				u32 fq_entries = 0;
+				// Stores no. of RX descs that can be filled in current iteration
+				u32 rx_entries = 0;
+
+				/* Get next socket */
+				flash_xs = cache_xs[out_buff->dst_flash_id]; 
+				if(unlikely(!flash_xs))
+					goto failed_outflow;
+				
+				/* Get array of pointers to FQ buffs */
+				struct xdp_buff **fq_buff_batch = pool->fq_buff_batch;
+				if (likely(avl_fq_entries < tx_entries)) {
+					out_buff->n_chain_fq_descs += xsk_buff_alloc_batch(flash_xs->pool, fq_buff_batch + avl_fq_entries, tx_entries - avl_fq_entries);
+					fq_entries = out_buff->n_chain_fq_descs;
+				} else
+					fq_entries = tx_entries;
+
+				/* fq_entries <= tx_entries at this point */
+
+				if (unlikely(fq_entries == 0))
+					goto failed_outflow;
+
+				/* Convert FQ buffs to descs */
+				struct xdp_desc *chain_fq_descs = out_buff->chain_fq_descs;
+				struct xdp_buff_xsk *xskb;
+				u64 addr;
+				for (u32 i = avl_fq_entries; i < out_buff->n_chain_fq_descs; i++) {
+					xskb = container_of(fq_buff_batch[i], struct xdp_buff_xsk, xdp);
+					addr = xp_get_handle(xskb);
+					chain_fq_descs[i].addr = addr;
+					// chain_fq_descs[i].len = out_buff->chain_tx_descs[i].len;
+					// chain_fq_descs[i].options = out_buff->chain_tx_descs[i].options;
+				}
+
+				if (pool->umem == flash_xs->pool->umem) {
+					/* Zero-copy magic */
+					u32 prod_head;
+					u32 prod_next;
+					
+					/* Try reserving fq_entries */
+					rx_entries = xskq_move_prod_head(flash_xs->rx, fq_entries, &prod_head, &prod_next);
+					/* rx_entries <= fq_entries at this point */
+					
+					if (unlikely(rx_entries < fq_entries))
+						flash_xs->rx_queue_full++;
+					
+					/* Enqueue tx_descs to RX ring of next socket */
+					if (likely(rx_entries != 0))
+						xskq_bulk_submit_rxtx(flash_xs->rx, out_buff->chain_tx_descs, prod_head, prod_next, rx_entries);
+
+					/* Add chain_fq_descs of next socket to CQ */
+					xskq_prod_write_addr_batch(pool->cq, chain_fq_descs + out_buff->n_chain_fq_descs - rx_entries, rx_entries);
+					sock_def_readable(&flash_xs->sk);
+				} else {
+					/* memcpy magic */
+					if (unlikely(!xsk_is_bound(flash_xs)))
+						goto failed_outflow;
+					
+					u32 prod_head;
+					u32 prod_next;
+
+					/* Try reserving fq_entries */
+					rx_entries = xskq_move_prod_head(flash_xs->rx, fq_entries, &prod_head, &prod_next);
+					/* rx_entries <= fq_entries at this point */
+
+					if (unlikely(rx_entries < fq_entries))
+						flash_xs->rx_queue_full++;
+
+					/* Memcpy packets */
+					for (u32 i = 0; i < rx_entries; i++) {
+						struct xdp_desc *desc = &(out_buff->chain_tx_descs[i]);
+						u32 frame_size = xsk_pool_get_rx_frame_size(flash_xs->pool);
+
+						chain_fq_descs[i + out_buff->n_chain_fq_descs - rx_entries].len = desc->len;
+						chain_fq_descs[i + out_buff->n_chain_fq_descs - rx_entries].options = desc->options;
+						void *copy_from = xsk_buff_raw_get_data(pool, desc->addr);
+
+						// Check
+						void *copy_to = xsk_buff_raw_get_data(flash_xs->pool, chain_fq_descs[i + out_buff->n_chain_fq_descs - rx_entries].addr);
+
+						// struct xdp_buff *xsk_xdp = fq_buff_batch[i + pool->n_chain_fq_descs - rx_entries];
+
+						if (likely(desc->len <= frame_size && !xp_mb_desc(desc))) {
+							// memcpy(xsk_xdp->data, copy_from, desc->len);
+							memcpy(copy_to, copy_from, desc->len);
+						}
+					}
+
+					/* Enqueue chain_fq_descs of next socket to RX of next socket */
+					if (likely(rx_entries != 0))
+						xskq_bulk_submit_rxtx(flash_xs->rx, chain_fq_descs + out_buff->n_chain_fq_descs - rx_entries, prod_head, prod_next, rx_entries);
+
+					/* Add chain_tx_descs of current socket to CQ */
+					xskq_prod_write_addr_batch(pool->cq, out_buff->chain_tx_descs, rx_entries);
+					sock_def_readable(&flash_xs->sk);
+				}
+				
+				/* rx_entries no. of descs actually sent */
+				/* Move unsent descs to end back of tx ring to retry in next iteration */
+				xskq_cons_cancel_n(xs->tx, tx_entries - rx_entries);
+				if(pool->n_out_buffs > 1)
+					xsk_tx_refill(xs->tx, &out_buff->chain_tx_descs[rx_entries], xs->tx->cached_cons, tx_entries - rx_entries);
+				out_buff->n_chain_tx_descs = 0;
+				
+				out_buff->n_chain_fq_descs -= rx_entries;
+				cq_submit += rx_entries;
+				continue;
+
+			failed_outflow:
+				xskq_cons_cancel_n(xs->tx, tx_entries);
+				if(pool->n_out_buffs > 1)
+					xsk_tx_refill(xs->tx, out_buff->chain_tx_descs, xs->tx->cached_cons, tx_entries);
+				out_buff->n_chain_tx_descs = 0;
+			}
+			
+			__xskq_cons_release(xs->tx);
+			if (xsk_tx_writeable(xs))
+				xs->sk.sk_write_space(&xs->sk);
+
+			rcu_read_unlock();
+
+			/* Submit the cq descs */
+			xsk_tx_completed(pool, cq_submit);
+			return;
+		}
+
+		/* Default no chaining path */
 		__xskq_cons_release(xs->tx);
 		if (xsk_tx_writeable(xs))
 			xs->sk.sk_write_space(&xs->sk);
-
-		/* Batching tx */
-		if(list_is_singular(&pool->xsk_tx_list) && pool->n_chain_tx_descs > 0 && flash_xsk_map[xs->flash_id] != NULL) {
-			u32 fq_entries = 0;
-			u32 n_chain_tx_descs = pool->n_chain_tx_descs;
-
-			/* Get next socket */
-			flash_xs = flash_xsk_map[xs->flash_id];
-
-			/* Get array of pointers to fq buffs */
-			// Check this line out (kevin)
-			// struct xdp_buff *xsk_xdp_batch[n_chain_tx_descs];
-			struct xdp_buff **fq_buff_batch = pool->fq_buff_batch;
-			fq_entries = xsk_buff_alloc_batch(flash_xs->pool, fq_buff_batch, n_chain_tx_descs);
-
-			/* Convert buffs to descs */
-			// Check this line out (kevin)
-			// struct xdp_desc fq_descs[fq_entries];
-			struct xdp_desc* fq_descs = pool->fq_descs;
-			struct xdp_buff_xsk *xskb;
-			u64 addr;
-			for(u32 i=0; i < fq_entries; i++){
-				xskb = container_of(fq_buff_batch[i], struct xdp_buff_xsk, xdp);
-				addr = xp_get_handle(xskb);
-				fq_descs[i].addr = addr;
-				fq_descs[i].len = pool->chain_tx_descs[i].len;
-				fq_descs[i].options = pool->chain_tx_descs[i].options;
-			}
-
-			if (pool->umem == flash_xs->pool->umem) {
-				/* Zero-copy magic - SPSC or MPSC */
-				/* MPSC */
-				/* Enqueue tx_descs to rx ring of next socket */
-				err = xskq_bulk_enqueue_rxtx(flash_xs->rx, pool->chain_tx_descs, fq_entries);
-
-				if (err) {
-					flash_xs->rx_queue_full++;
-					pool->n_chain_tx_descs = 0;
-					rcu_read_unlock();
-					return;
-				}
-
-				/* Add fq_descs of next socket to cq */
-				pool->cq->cached_prod -= n_chain_tx_descs;
-				xskq_prod_write_addr_batch(pool->cq, fq_descs, fq_entries);
-			} else {
-				/* memcpy magic - MPSC required */
-				if (!xsk_is_bound(flash_xs)) {
-					pr_warn("flash socket is not bound\n");
-					pool->n_chain_tx_descs = 0;
-					rcu_read_unlock();
-					return;
-				}
-
-				/* Memcpy packets */
-				for(u32 i=0; i<fq_entries; i++){
-					struct xdp_desc* desc = &(pool->chain_tx_descs[i]);
-					u32 frame_size = xsk_pool_get_rx_frame_size(flash_xs->pool);
-
-					void *copy_from = xsk_buff_raw_get_data(pool, desc->addr);
-
-					struct xdp_buff *xsk_xdp = fq_buff_batch[i];
-
-					if (desc->len <= frame_size && !xp_mb_desc(desc)) {
-						memcpy(xsk_xdp->data, copy_from, desc->len);
-					}
-				}
-
-				/* Enqueue fq_descs of next socket to rx of next socket */
-				err = xskq_bulk_enqueue_rxtx(flash_xs->rx, fq_descs, fq_entries);
-				if (err) {
-					flash_xs->rx_queue_full++;
-					pool->n_chain_tx_descs = 0;
-					rcu_read_unlock();
-					return;
-				}
-
-				/* Add tx_descs to cq */
-				pool->cq->cached_prod -= n_chain_tx_descs;
-				xskq_prod_write_addr_batch(pool->cq, pool->chain_tx_descs, fq_entries);
-			}
-
-			pool->n_chain_tx_descs = 0;
-			rcu_read_unlock();
-			return;
-		}
 	}
 
 	rcu_read_unlock();
 }
 EXPORT_SYMBOL(xsk_tx_release);
 
-/* Batching */
 bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 {
 	bool budget_exhausted = false;
@@ -572,17 +644,24 @@ again:
 
 		xs->tx_budget_spent++;
 
-		/* flash magic */
-		if (list_is_singular(&pool->xsk_tx_list) && flash_xsk_map[xs->flash_id] != NULL) {
-			/* Batching tx */
-			pool->chain_tx_descs[pool->n_chain_tx_descs] = *desc;
-			pool->n_chain_tx_descs++;
+		/* FLASH magic */
+		if (list_is_singular(&pool->xsk_tx_list) && xs_chain[xs->flash_id]) {
+			int out_id = get_outflow(desc, pool);
+			if(out_id < 0 || out_id >= pool->n_out_buffs) {
+				xs->tx->invalid_descs++;
+				goto out;
+			}
 
-			/* Back Pressure */
+			/* Reserve anonymous space in CQ for backpressure */
 			if (xskq_prod_reserve(pool->cq))
 				goto out;
 
-			desc->options |= (FLASH_NO_TX_FLUSH | FLASH_NO_TX);
+			pool->n_cq_reserved++;
+
+			/* Store tx desc in buffer for batching */
+			struct chain_out_buff *out_buff = &pool->out_buffs[out_id];
+			out_buff->chain_tx_descs[out_buff->n_chain_tx_descs] = *desc;
+			out_buff->n_chain_tx_descs++;
 
 			xskq_cons_release(xs->tx);
 			rcu_read_unlock();
@@ -616,187 +695,15 @@ out:
 }
 EXPORT_SYMBOL(xsk_tx_peek_desc);
 
-
-/* Original */
-// bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
-// {
-// 	bool budget_exhausted = false;
-// 	struct xdp_sock *xs;
-// 	struct xdp_sock *flash_xs; /* Next socket to send (flash) */
-// 	int err;
-// 	/* not required for MPSC */
-// 	// struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
-
-// 	rcu_read_lock();
-// again:
-// 	list_for_each_entry_rcu(xs, &pool->xsk_tx_list, tx_list) {
-// 		if (xs->tx_budget_spent >= MAX_PER_SOCKET_BUDGET) {
-// 			budget_exhausted = true;
-// 			continue;
-// 		}
-
-// 		if (!xskq_cons_peek_desc(xs->tx, desc, pool)) {
-// 			if (xskq_has_descs(xs->tx))
-// 				xskq_cons_release(xs->tx);
-// 			continue;
-// 		}
-
-// 		xs->tx_budget_spent++;
-
-// 		/* flash magic */
-// 		if (flash_xsk_map[xs->flash_id] != NULL) {
-// 			flash_xs = flash_xsk_map[xs->flash_id];
-
-// 			/* Zero-copy magic - SPSC or MPSC */
-// 			if (pool->umem == flash_xs->pool->umem) {
-// 				/* SPSC - one softirq chaining
-// 				 * TODO: one softirq chaining implementation integration
-// 				 */
-// 				// err = xskq_prod_reserve_desc(flash_xs->rx, desc->addr, desc->len, desc->options);
-
-// 				/* MPSC*/
-// 				err = xskq_enqueue_rxtx(flash_xs->rx, desc->addr, desc->len, desc->options);
-
-// 				if (err) {
-// 					flash_xs->rx_queue_full++;
-// 					goto out;
-// 				}
-
-// 				/* Only required for MPSC - start */
-// 				struct xdp_buff *xsk_xdp;
-// 				struct xdp_buff_xsk *xskb;
-
-// 				xsk_xdp = xsk_buff_alloc(flash_xs->pool);
-// 				if (!xsk_xdp) {
-// 					flash_xs->rx_dropped++;
-// 					goto out;
-// 				}
-
-// 				xskb = container_of(xsk_xdp, struct xdp_buff_xsk, xdp);
-
-// 				u64 addr = xp_get_handle(xskb);
-// 				/* Only required for MPSC - end */
-
-// 				/* Backpressure for MPSC */
-// 				if (xskq_prod_reserve_addr(pool->cq, addr))
-// 					goto out;
-
-// 				/* Backpressure for SPSC */
-// 				// if (xskq_prod_reserve_addr(pool->cq, desc->addr))
-// 				// 	goto out;
-
-// 				/* Adding flash xs to the flush_list if not added yet */
-// 				/* Not required for MPSC */
-// 				// if (!flash_xs->flush_node.prev)
-// 				// 	list_add(&flash_xs->flush_node, flush_list);
-				
-// 				// This is also required to be cleaned up
-// 				// desc->options |= flash_NO_TX;
-
-// 				/* Only required for MPSC */
-// 				desc->options |= (flash_NO_TX_FLUSH | flash_NO_TX);
-
-// 				xskq_cons_release(xs->tx);
-// 				rcu_read_unlock();
-// 				return true;
-// 			}
-
-// 			/* memcpy magic - MPSC required */
-// 			if (!xsk_is_bound(flash_xs)) {
-// 				printk(KERN_WARNING "flash: flash_xs is not bound\n");
-// 				goto out;
-// 			}
-
-// 			u32 frame_size = xsk_pool_get_rx_frame_size(flash_xs->pool);
-// 			void *copy_from = xsk_buff_raw_get_data(pool, desc->addr);
-
-// 			struct xdp_buff_xsk *xskb;
-// 			struct xdp_buff *xsk_xdp;
-
-// 			if (desc->len <= frame_size && !xp_mb_desc(desc)) {
-// 				xsk_xdp = xsk_buff_alloc(flash_xs->pool);
-// 				if (!xsk_xdp) {
-// 					flash_xs->rx_dropped++;
-// 					goto out;
-// 				}
-
-// 				memcpy(xsk_xdp->data, copy_from, desc->len);
-// 				xskb = container_of(xsk_xdp, struct xdp_buff_xsk, xdp);
-// 				err = __xsk_rcv_zc(flash_xs, xskb, desc->len, desc->options);
-// 				if (err) {
-// 					xsk_buff_free(xsk_xdp);
-// 					goto out;
-// 				}
-
-// 				/* Backpressure */
-// 				if (xskq_prod_reserve_addr(pool->cq, desc->addr))
-// 					goto out;
-				
-// 				desc->options |= (flash_NO_TX_FLUSH | flash_NO_TX);
-
-// 				xskq_cons_release(xs->tx);
-// 				rcu_read_unlock();
-// 				return true;
-// 			}
-// 		}
-
-// 		/* This is the backpressure mechanism for the Tx path.
-// 		 * Reserve space in the completion queue and only proceed
-// 		 * if there is space in it. This avoids having to implement
-// 		 * any buffering in the Tx path.
-// 		 */
-// 		if (xskq_prod_reserve_addr(pool->cq, desc->addr))
-// 			goto out;
-
-// 		xskq_cons_release(xs->tx);
-// 		rcu_read_unlock();
-// 		return true;
-// 	}
-
-// 	if (budget_exhausted) {
-// 		list_for_each_entry_rcu(xs, &pool->xsk_tx_list, tx_list)
-// 			xs->tx_budget_spent = 0;
-
-// 		budget_exhausted = false;
-// 		goto again;
-// 	}
-
-// out:
-// 	rcu_read_unlock();
-// 	return false;
-// }
-// EXPORT_SYMBOL(xsk_tx_peek_desc);
-
 static u32 xsk_tx_peek_release_fallback(struct xsk_buff_pool *pool, u32 max_entries)
 {
 	struct xdp_desc *descs = pool->tx_descs;
 	u32 nb_pkts = 0;
-	u32 total_pkts = 0;
-	bool mc = false;
 
-	/* TODO - optimization */
-	while (total_pkts < max_entries && xsk_tx_peek_desc(pool, &descs[nb_pkts])) {
-		total_pkts++;
-		if (descs[nb_pkts].options & FLASH_NO_TX) {
-			if (descs[nb_pkts].options & FLASH_NO_TX_FLUSH)
-				mc = true;
-			continue;
-		} else
-			nb_pkts++;
-	}
+	while (nb_pkts < max_entries && xsk_tx_peek_desc(pool, &descs[nb_pkts]))
+		nb_pkts++;
 
 	xsk_tx_release(pool);
-
-	/* TODO: Check if this is required */
-	// pool->total_cnt = total_pkts;
-
-	if (nb_pkts != total_pkts) {
-		if (mc)
-			xskq_prod_submit(pool->cq);
-		/* Not required for MPSC */
-		// xdp_do_flush();
-	}
-
 	return nb_pkts;
 }
 
@@ -838,6 +745,17 @@ u32 xsk_tx_peek_release_desc_batch(struct xsk_buff_pool *pool, u32 nb_pkts)
 	nb_pkts = xskq_prod_nb_free(pool->cq, nb_pkts);
 	if (!nb_pkts)
 		goto out;
+
+	if(xs_chain[xs->flash_id]){
+		nb_pkts = xskq_cons_read_desc_batch_chain(xs->tx, pool, nb_pkts);
+		if (!nb_pkts) {
+			xs->tx->queue_empty_descs++;
+			goto out;
+		}
+		rcu_read_unlock();
+		xsk_tx_release(pool);
+		return nb_pkts;
+	}
 
 	nb_pkts = xskq_cons_read_desc_batch(xs->tx, pool, nb_pkts);
 	if (!nb_pkts) {
@@ -1201,7 +1119,7 @@ static int xsk_generic_xmit(struct sock *sk)
 	/* Drop the RCU lock since the SKB path might sleep. */
 	rcu_read_unlock();
 	ret = __xsk_generic_xmit(sk);
-	/* Reaquire RCU lock before going into common code. */
+	/* Reacquire RCU lock before going into common code. */
 	rcu_read_lock();
 
 	return ret;
@@ -1511,15 +1429,12 @@ static struct xdp_sock *find_xsk_by_flash_id(int id)
 }
 
 static void free_flash_id(int id)
-{
+{	
+	cache_xs[id] = NULL;
+	xs_chain[id] = false;
+
 	unsigned long flags;
 	spin_lock_irqsave(&flash_idr_lock, flags);
-	struct xdp_sock *flash_xs = idr_find(&flash_idr, id);
-	/* TODO: Optimization for 2D maps */
-	for (int i = 0; i < FLASH_MAX_XSK; i++) {
-		if (flash_xsk_map[i] == flash_xs)
-			WRITE_ONCE(flash_xsk_map[i], NULL);
-	}
 	idr_remove(&flash_idr, id);
 	spin_unlock_irqrestore(&flash_idr_lock, flags);
 }
@@ -1572,6 +1487,9 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	err = alloc_flash_id(xs);
 	if (err)
 		goto out_unlock;
+
+	/* Store the pointer in the cache */
+	cache_xs[xs->flash_id] = xs;
 
 	/* Create flash object for sysfs */
 	xs->flash_object = (void *)create_flash_obj(xs->flash_id, current->pid, current->comm, sxdp->sxdp_ifindex, qid);
@@ -1632,6 +1550,12 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 			}
 		} else {
 			/* Share the buffer pool with the other socket. */
+
+			/* Do not allow this setup in flash. Leads to crash otherwise */
+			err = -EINVAL;
+			sockfd_put(sock);
+			goto out_unlock;
+
 			if (xs->fq_tmp || xs->cq_tmp) {
 				/* Do not allow setting your own fq or cq. */
 				err = -EINVAL;
@@ -1656,15 +1580,6 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 				}
 			}
 
-			if (xs->tx && !xs->pool->chain_tx_descs) {
-				err = xp_alloc_chain_tx_descs(xs->pool, xs);
-				if (err) {
-					xp_put_pool(xs->pool);
-					xs->pool = NULL;
-					sockfd_put(sock);
-					goto out_unlock;
-				}
-			}
 		}
 
 		xdp_get_umem(umem_xs->umem);
@@ -1718,9 +1633,12 @@ out_release:
 	return err;
 }
 
-int flash_update_chain_map(int current_id, int next_id)
+int flash_update_chain_map(int current_id, int *next_ids, int next_count)
 {
 	struct xdp_sock *dst_xsk, *src_xsk;
+
+	if (next_ids == NULL)
+		return -EINVAL;
 
 	src_xsk = find_xsk_by_flash_id(current_id);
 	if (src_xsk == NULL)
@@ -1729,20 +1647,34 @@ int flash_update_chain_map(int current_id, int next_id)
 	if (src_xsk->state != XSK_READY && src_xsk->state != XSK_BOUND)
 		return -EBUSY;
 
-	if (next_id != -1) {
-		dst_xsk = find_xsk_by_flash_id(next_id);
+	if (next_ids[0] == -1) {
+		WRITE_ONCE(xs_chain[current_id], false);
+		destroy_out_buffs(src_xsk->pool);
+		src_xsk->pool->no_tx_out = false;
+		return 1;
+	}
+
+	for (int i = 0; i < next_count; i++) {
+		dst_xsk = find_xsk_by_flash_id(next_ids[i]);
 		if (dst_xsk == NULL)
 			return -EINVAL;
-
-		WRITE_ONCE(flash_xsk_map[src_xsk->flash_id], dst_xsk);
-	} else {
-		WRITE_ONCE(flash_xsk_map[src_xsk->flash_id], NULL);
+		pr_info("chain: %d->%d\n", current_id, next_ids[i]);
 	}
+
+	if (src_xsk->pool->out_buffs != NULL)
+		destroy_out_buffs(src_xsk->pool);
+
+	int err = alloc_out_buffs(src_xsk, next_ids, next_count);
+	if (err)
+		return -EBUSY;
+
+	src_xsk->pool->no_tx_out = true;
+	WRITE_ONCE(xs_chain[current_id], true);
 
 	/* Debug (show map list) */
 	for (int i = 0; i < FLASH_MAX_XSK; i++) {
-		if (flash_xsk_map[i] != NULL)
-			pr_info("flash_xsk_map[%d] = %d\n", i, flash_xsk_map[i]->flash_id);
+		if (xs_chain[i])
+			pr_info("xs_chain[%d] = true\n", i);
 	}
 
 	return 0;
@@ -2118,8 +2050,11 @@ static void xsk_destruct(struct sock *sk)
 
 	if (!xp_put_pool(xs->pool))
 		xdp_put_umem(xs->umem, !xs->pool);
+	
+	if (xs->flash_id == -1)
+		return;
 
-	/* Removing batch bufferes of flash */
+	/* Removing batch buferes of flash */
 	kvfree(xs->rx->rx_descs);
 
 	/* Freeing up id and obj - can be used by new xsks (flash) */
@@ -2159,6 +2094,7 @@ static int xsk_create(struct net *net, struct socket *sock, int protocol,
 
 	xs = xdp_sk(sk);
 	xs->state = XSK_READY;
+	xs->flash_id = -1;
 	mutex_init(&xs->mutex);
 	spin_lock_init(&xs->rx_lock);
 
