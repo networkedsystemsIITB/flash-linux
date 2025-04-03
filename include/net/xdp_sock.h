@@ -15,6 +15,7 @@
 #include <net/sock.h>
 
 #define XDP_UMEM_SG_FLAG (1 << 1)
+#define FLASH_NO_TX (1 << 2) /* Don't transmit packet in driver */
 
 struct net_device;
 struct xsk_queue;
@@ -91,6 +92,11 @@ struct xdp_sock {
 	struct mutex mutex;
 	struct xsk_queue *fq_tmp; /* Only as tmp storage before bind */
 	struct xsk_queue *cq_tmp; /* Only as tmp storage before bind */
+
+	/* Socket ID that is used for socket chaining (flash) */
+	int flash_id;
+	/* pointer to flash_obj */
+	void *flash_object;
 };
 
 /*

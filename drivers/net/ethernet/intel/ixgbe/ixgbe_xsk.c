@@ -397,6 +397,7 @@ static bool ixgbe_xmit_zc(struct ixgbe_ring *xdp_ring, unsigned int budget)
 	struct xdp_desc desc;
 	dma_addr_t dma;
 	u32 cmd_type;
+	bool flash_flush = false;
 
 	while (budget-- > 0) {
 		if (unlikely(!ixgbe_desc_unused(xdp_ring))) {
@@ -409,6 +410,11 @@ static bool ixgbe_xmit_zc(struct ixgbe_ring *xdp_ring, unsigned int budget)
 
 		if (!xsk_tx_peek_desc(pool, &desc))
 			break;
+
+		if (desc.options & FLASH_NO_TX) {
+			flash_flush = true;
+			continue;
+		}
 
 		dma = xsk_buff_raw_get_dma(pool, desc.addr);
 		xsk_buff_raw_dma_sync_for_device(pool, dma, desc.len);
@@ -439,6 +445,9 @@ static bool ixgbe_xmit_zc(struct ixgbe_ring *xdp_ring, unsigned int budget)
 		ixgbe_xdp_ring_update_tail(xdp_ring);
 		xsk_tx_release(pool);
 	}
+
+	if (flash_flush)
+		xdp_do_flush();
 
 	return !!budget && work_done;
 }

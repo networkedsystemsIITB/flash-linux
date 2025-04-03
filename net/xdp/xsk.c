@@ -30,12 +30,21 @@
 
 #include "xsk_queue.h"
 #include "xdp_umem.h"
+#include "xsk_sysfs.h"
 #include "xsk.h"
 
 #define TX_BATCH_SIZE 32
 #define MAX_PER_SOCKET_BUDGET (TX_BATCH_SIZE)
+#define FLASH_MAX_XSK 64
 
 static DEFINE_PER_CPU(struct list_head, xskmap_flush_list);
+static DEFINE_IDR(flash_idr); /* IDR allocation (flash) */
+
+/* Lock to protect idr accesess (flash) */
+static DEFINE_SPINLOCK(flash_idr_lock);
+
+/* flash XSK map (flash) - Only use atomic operation for r/w operation */
+static struct xdp_sock *flash_xsk_map[FLASH_MAX_XSK] = {NULL};
 
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
 {
@@ -430,6 +439,10 @@ bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc)
 {
 	bool budget_exhausted = false;
 	struct xdp_sock *xs;
+	struct xdp_sock *flash_xs;
+	int err;
+
+	struct list_head *flush_list = this_cpu_ptr(&xskmap_flush_list);
 
 	rcu_read_lock();
 again:
@@ -446,6 +459,35 @@ again:
 		}
 
 		xs->tx_budget_spent++;
+
+		/* flash magic */
+		if (flash_xsk_map[xs->flash_id] != NULL) {
+			flash_xs = flash_xsk_map[xs->flash_id];
+
+			/* Zero-copy magic - SPSC or MPSC */
+			if (pool->umem == flash_xs->pool->umem) {
+				err = xskq_prod_reserve_desc(flash_xs->rx, desc->addr, desc->len, desc->options);
+
+				if (err) {
+					flash_xs->rx_queue_full++;
+					goto out;
+				}
+
+				/* Backpressure for SPSC */
+				// if (xskq_prod_reserve_addr(pool->cq, desc->addr))
+				// 	goto out;
+
+				/* Adding flash xs to the flush_list if not added yet */
+				if (!flash_xs->flush_node.prev)
+					list_add(&flash_xs->flush_node, flush_list);
+				
+				desc->options |= FLASH_NO_TX;
+
+				xskq_cons_release(xs->tx);
+				rcu_read_unlock();
+				return true;
+			}
+		}
 
 		/* This is the backpressure mechanism for the Tx path.
 		 * Reserve space in the completion queue and only proceed
@@ -1155,6 +1197,48 @@ static bool xsk_validate_queues(struct xdp_sock *xs)
 	return xs->fq_tmp && xs->cq_tmp;
 }
 
+static int alloc_flash_id(struct xdp_sock *xs)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&flash_idr_lock, flags);
+	retval = idr_alloc(&flash_idr, xs, 0, FLASH_MAX_XSK, GFP_KERNEL);
+	if (retval >= 0) {
+		xs->flash_id = retval;
+		retval = 0;
+	} else if (retval == -ENOSPC) {
+		printk(KERN_WARNING "flash: Exceeded maximum number of XSKs\n");
+		retval = -EINVAL;
+	}
+	spin_unlock_irqrestore(&flash_idr_lock, flags);
+	return retval;
+}
+
+static struct xdp_sock *find_xsk_by_flash_id(int id)
+{
+	struct xdp_sock *xs;
+	unsigned long flags;
+
+	spin_lock_irqsave(&flash_idr_lock, flags);
+	xs = idr_find(&flash_idr, id);
+	spin_unlock_irqrestore(&flash_idr_lock, flags);
+	return xs;
+}
+
+static void free_flash_id(int id)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&flash_idr_lock, flags);
+	struct xdp_sock *flash_xs = idr_find(&flash_idr, id);
+	for (int i = 0; i < FLASH_MAX_XSK; i++) {
+		if (flash_xsk_map[i] == flash_xs)
+			WRITE_ONCE(flash_xsk_map[i], NULL);
+	}
+	idr_remove(&flash_idr, id);
+	spin_unlock_irqrestore(&flash_idr_lock, flags);
+}
+
 static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 {
 	struct sockaddr_xdp *sxdp = (struct sockaddr_xdp *)addr;
@@ -1198,6 +1282,17 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	}
 
 	qid = sxdp->sxdp_queue_id;
+
+	err = alloc_flash_id(xs);
+	if (err)
+		goto out_unlock;
+
+	/* Create flash object for sysfs */
+	xs->flash_object = (void *)create_flash_obj(xs->flash_id, current->pid, current->comm, sxdp->sxdp_ifindex, qid);
+	if (!xs->flash_object) {
+		err = -EINVAL;
+		goto out_unlock;
+	}
 
 	if (flags & XDP_SHARED_UMEM) {
 		struct xdp_sock *umem_xs;
@@ -1298,6 +1393,9 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 		}
 	}
 
+	/* Debug */
+	pr_info("flash_id = %d\n", xs->flash_id);
+
 	/* FQ and CQ are now owned by the buffer pool and cleaned up with it. */
 	xs->fq_tmp = NULL;
 	xs->cq_tmp = NULL;
@@ -1322,6 +1420,36 @@ out_release:
 	mutex_unlock(&xs->mutex);
 	rtnl_unlock();
 	return err;
+}
+
+int flash_update_chain_map(int current_id, int next_id)
+{
+	struct xdp_sock *dst_xsk, *src_xsk;
+
+	src_xsk = find_xsk_by_flash_id(current_id);
+	if (src_xsk == NULL)
+		return -EINVAL;
+
+	if (src_xsk->state != XSK_READY && src_xsk->state != XSK_BOUND)
+		return -EBUSY;
+
+	if (next_id != -1) {
+		dst_xsk = find_xsk_by_flash_id(next_id);
+		if (dst_xsk == NULL)
+			return -EINVAL;
+
+		WRITE_ONCE(flash_xsk_map[src_xsk->flash_id], dst_xsk);
+	} else {
+		WRITE_ONCE(flash_xsk_map[src_xsk->flash_id], NULL);
+	}
+
+	/* Debug (show map list) */
+	for (int i = 0; i < FLASH_MAX_XSK; i++) {
+		if (flash_xsk_map[i] != NULL)
+			pr_info("flash_xsk_map[%d] = %d\n", i, flash_xsk_map[i]->flash_id);
+	}
+
+	return 0;
 }
 
 struct xdp_umem_reg_v1 {
@@ -1694,6 +1822,9 @@ static void xsk_destruct(struct sock *sk)
 
 	if (!xp_put_pool(xs->pool))
 		xdp_put_umem(xs->umem, !xs->pool);
+
+	free_flash_id(xs->flash_id);
+	destroy_flash_obj((struct flash_obj *)xs->flash_object);
 }
 
 static int xsk_create(struct net *net, struct socket *sock, int protocol,
@@ -1787,6 +1918,10 @@ static int __init xsk_init(void)
 		goto out_sk;
 
 	err = register_netdevice_notifier(&xsk_netdev_notifier);
+	if (err)
+		goto out_pernet;
+
+	err = flash_sysfs_init();
 	if (err)
 		goto out_pernet;
 
