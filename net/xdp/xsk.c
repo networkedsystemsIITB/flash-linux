@@ -49,6 +49,10 @@ true => socket's output goes to next NF,
 false => socket's output goes out to NIC */
 static bool xs_chain[FLASH_MAX_XSK] = {0};
 
+/* Reverse graph of flash sockets (flash) */
+static int reverse_graph[FLASH_MAX_XSK][FLASH_MAX_XSK] = {0};
+static int indegree[FLASH_MAX_XSK] = {0};
+
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
 {
 	if (pool->cached_need_wakeup & XDP_WAKEUP_RX)
@@ -539,6 +543,20 @@ void handle_single_copy(struct xsk_buff_pool *pool, struct chain_out_buff *out_b
 	*rx_entries = rx;
 }
 
+static void xsk_flash_try_wakeup_upstream_nf(struct xdp_sock* xs) {
+	if(xs->flash_id < 0 || xs->flash_id >= FLASH_MAX_XSK)
+		return;
+	for (int i = 0; i < indegree[xs->flash_id]; i++) {
+		int prev_id = reverse_graph[xs->flash_id][i];
+		struct xdp_sock *prev_xs = cache_xs[prev_id];
+
+		if (prev_xs == NULL || prev_xs->flash_id < 0 || prev_xs->flash_id >= FLASH_MAX_XSK)
+			continue;
+		if (xsk_tx_writeable(prev_xs))
+			prev_xs->sk.sk_write_space(&prev_xs->sk);
+	}
+}
+
 void xsk_tx_release(struct xsk_buff_pool *pool)
 {
 	struct xdp_sock *xs, *flash_xs;
@@ -607,8 +625,8 @@ failed_outflow:
 		}
 
 		__xskq_cons_release(xs->tx);
-		if (xsk_tx_writeable(xs))
-			xs->sk.sk_write_space(&xs->sk);
+		// if (xsk_tx_writeable(xs))
+		// 	xs->sk.sk_write_space(&xs->sk);
 
 		/* Submit the cq descs */
 		xsk_tx_completed(pool, cq_submit);
@@ -1087,7 +1105,7 @@ static int __xsk_generic_xmit(struct sock *sk)
 
 out:
 	if (sent_frame)
-		if (xsk_tx_writeable(xs))
+		if (xsk_tx_writeable(xs) && !xs_chain[xs->flash_id])
 			sk->sk_write_space(sk);
 
 	mutex_unlock(&xs->mutex);
@@ -1179,6 +1197,11 @@ static int __xsk_recvmsg(struct socket *sock, struct msghdr *m, size_t len, int 
 	struct sock *sk = sock->sk;
 	struct xdp_sock *xs = xdp_sk(sk);
 	int err;
+
+	if (flags & MSG_MORE) {
+		xsk_flash_try_wakeup_upstream_nf(xs);
+		return 0;
+	}
 
 	err = xsk_check_common(xs);
 	if (err)
@@ -1642,6 +1665,9 @@ int flash_update_chain_map(int current_id, int *next_ids, int next_count)
 		if (dst_xsk == NULL || dst_xsk != cache_xs[next_ids[i]] || dst_xsk == src_xsk)
 			return -EINVAL;
 		pr_info("chain: %d->%d\n", current_id, next_ids[i]);
+
+		// update reverse graph
+		reverse_graph[next_ids[i]][indegree[next_ids[i]]++] = current_id;
 	}
 
 	if (src_xsk->pool->out_buffs != NULL)
