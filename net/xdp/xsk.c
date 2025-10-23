@@ -495,6 +495,24 @@ void handle_zero_copy(struct xsk_buff_pool *pool, struct chain_out_buff *out_buf
 
 	/* Add chain_fq_descs of next socket to cq */
 	xskq_prod_write_addr_batch(pool->cq, out_buff->chain_fq_descs + out_buff->n_chain_fq_descs - rx, rx);
+
+	struct xdp_desc *descs = out_buff->chain_fq_descs + out_buff->n_chain_fq_descs - rx;
+	struct xsk_buff_pool *flash_pool = flash_xs->pool;
+	uint8_t edge_id = out_buff - pool->out_buffs;
+	void *data_ptr;
+	u64 addr;
+	for (u32 i = 0; i < rx; i++) {
+		addr = descs[i].addr;
+		data_ptr = flash_pool->addrs;
+		if (flash_pool->unaligned) {
+			addr = (addr & XSK_UNALIGNED_BUF_ADDR_MASK) + (addr >> XSK_UNALIGNED_BUF_OFFSET_SHIFT);
+		}
+		data_ptr += addr;
+		// void *data_ptr = xsk_buff_raw_get_data(flash_xs->pool, descs[i].addr);
+		if (data_ptr) {
+			*(uint8_t *)data_ptr = edge_id;
+		}
+	}
 	sock_def_readable(&flash_xs->sk);
 	*rx_entries = rx;
 }
