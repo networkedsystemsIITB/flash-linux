@@ -48,8 +48,6 @@ struct xsk_queue {
 	u32 cached_prod;
 	u32 cached_cons;
 	struct xdp_ring *ring;
-	struct xdp_desc *rx_descs; /* For rx batching in flash */
-	u32 n_rx_descs; 		   /* For rx batching in flash */
 	u64 invalid_descs;
 	u64 queue_empty_descs;
 	size_t ring_vmalloc_size;
@@ -282,55 +280,6 @@ u32 xskq_cons_read_desc_batch(struct xsk_queue *q, struct xsk_buff_pool *pool,
 	return total_descs;
 }
 
-/* Returns extracted outflow index from desc options */
-static inline int get_outflow(struct xdp_desc *desc, struct xsk_buff_pool *pool)
-{	
-	if(unlikely(!pool->out_buffs))
-		return -1;
-	if(pool->n_out_buffs == 1)
-		return 0;
-
-	int next_id = (int)(desc->options >> 16);
-
-	return next_id;
-}
-
-/* Consumes max no. of descs from tx ring and stores in out_buffs */
-static inline
-u32 xskq_cons_read_desc_batch_chain(struct xsk_queue *q, struct xsk_buff_pool *pool,
-			      u32 max)
-{
-	u32 cached_cons = q->cached_cons, nb_entries = 0;
-	
-	while (cached_cons != q->cached_prod && nb_entries < max) {
-		struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
-		u32 idx = cached_cons & q->ring_mask;
-		struct parsed_desc parsed;
-		struct xdp_desc* desc = &ring->desc[idx];
-
-		int out_id = get_outflow(desc, pool);
-		cached_cons++;
-		if(unlikely(out_id < 0 || out_id >= pool->n_out_buffs)) {
-			q->invalid_descs++;
-			break;
-		}
-
-		parse_desc(q, pool, desc, &parsed);
-		if (unlikely(!parsed.valid))
-			break;
-
-		struct chain_out_buff *out_buff = &pool->out_buffs[out_id];
-		out_buff->chain_tx_descs[out_buff->n_chain_tx_descs] = *desc;
-		out_buff->n_chain_tx_descs++;
-		
-		nb_entries++;
-	}
-
-	/* Release valid plus any invalid entries */
-	xskq_cons_release_n(q, cached_cons - q->cached_cons);
-	return nb_entries;
-}
-
 /* Functions for consumers */
 
 static inline void __xskq_cons_release(struct xsk_queue *q)
@@ -516,15 +465,21 @@ static inline u64 xskq_nb_queue_empty_descs(struct xsk_queue *q)
 	return q ? q->queue_empty_descs : 0;
 }
 
-/* SPMC or MPSC operations */
+/* Returns extracted outflow index from desc->options */
+static inline int get_outflow(struct xdp_desc *desc, struct xsk_buff_pool *pool)
+{	
+	if (unlikely(!pool->out_buffs))
+		return -1;
 
-static inline u32 xskq_cons_available_entries(struct xsk_queue *q, u32 max)
-{
-	struct xdp_ring *ring = (struct xdp_ring *)q->ring;
-	u32 entries = READ_ONCE(ring->producer) - READ_ONCE(ring->consumer_head);
+	if (pool->n_out_buffs == 1)
+		return 0;
 
-	return entries >= max ? max : entries;
+	int next_id = (int)(desc->options >> 16);
+
+	return next_id;
 }
+
+/* Functions for SPMC or MPSC operations */
 
 static inline u32 xskq_move_prod_head(struct xsk_queue *q, u32 n, u32 *old_head, u32 *new_head)
 {
@@ -627,7 +582,145 @@ static inline void xskq_update_cons_tail(struct xdp_ring *ring, u32 old_val, u32
     writel(new_val, &ring->consumer);
 }
 
-static inline int xskq_enqueue_rxtx(struct xsk_queue *q, u64 addr, u32 len, u32 flags)
+/* Used by driver to find available entries during batching */
+static inline u32 xskq_cons_available_entries(struct xsk_queue *q, u32 max)
+{
+	struct xdp_ring *ring = (struct xdp_ring *)q->ring;
+	u32 entries = READ_ONCE(ring->producer) - READ_ONCE(ring->consumer_head);
+
+	return entries >= max ? max : entries;
+}
+
+/* Can be used by kernel to enqueue an addr to fq/cq ring */
+static inline int xskq_enqueue_addr(struct xsk_queue *q, u64 addr)
+{	
+	u32 prod_head;
+	u32 prod_next;
+
+	u32 idx;
+
+	u32 n = xskq_move_prod_head(q, 1, &prod_head, &prod_next);
+
+	/* Ring full */
+	if(n == 0) 
+		return -ENOBUFS;
+
+	struct xdp_umem_ring *ring = (struct xdp_umem_ring *)q->ring;
+	
+	idx = prod_head & q->ring_mask;
+	ring->desc[idx] = addr;
+
+	xskq_update_prod_tail((struct xdp_ring *)ring, prod_head, prod_next);
+
+	return 0;
+}
+
+/* Can be used by kernel to dequeue an addr from fq/cq ring.
+ * The batching variant for the same is used for fq.
+ * It is present in xsk_buff_pool.c - `xp_alloc_new_from_fq()`
+ */
+static inline bool xskq_dequeue_addr(struct xsk_queue *q, u64* addr)
+{	
+	u32 cons_head;
+	u32 cons_next;
+
+	struct xdp_umem_ring *ring = (struct xdp_umem_ring *)q->ring;
+	u32 idx;
+
+	u32 n = xskq_move_cons_head(q, 1, &cons_head, &cons_next);
+
+	/* Ring empty */
+	if(n == 0) 
+		return false;
+
+	/* A, matches D */
+	idx = cons_head & q->ring_mask;
+	*addr = ring->desc[idx];
+
+	xskq_update_cons_tail((struct xdp_ring *)ring, cons_head, cons_next);
+
+	return true;
+}
+
+/* Used by kernel to batch rx packets for MPSC */
+static inline void xskq_rx_store_desc(struct xsk_buff_pool *pool,
+					 u64 addr, u32 len, u32 flags)
+{
+	u32 idx;
+
+	/* Batching Rx - without checking for space
+	 * We are considering that flush will happen before
+	 * the entire rx_descs runs out of space.
+	 */
+	idx = pool->n_rx_descs++;
+	pool->rx_descs[idx].addr = addr;
+	pool->rx_descs[idx].len = len;
+	pool->rx_descs[idx].options = flags;
+}
+
+/* Resets the store for rx_descs */
+static inline void xskq_rx_reset_descs(struct xsk_buff_pool *pool)
+{
+	pool->n_rx_descs = 0;
+}
+
+/* Used by kernel to batch tx packets during packet redirection */
+static inline void xskq_tx_store_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc, int out_id)
+{
+	struct chain_out_buff *out_buff = &pool->out_buffs[out_id];
+
+	out_buff->chain_tx_descs[out_buff->n_chain_tx_descs++] = *desc;
+}
+
+/* Refills tx ring starting at start_idx with num amount of descs */
+static inline void xsk_tx_refill(struct xsk_queue *tx, struct xdp_desc *descs, u32 start_idx, u32 num)
+{
+	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)tx->ring;
+	u32 idx = start_idx & tx->ring_mask;
+	
+	for (u32 i = 0; i < num; i++) {
+		ring->desc[idx] = descs[i];
+		idx = ((idx + 1) & tx->ring_mask);
+	}
+}
+
+/* Consumes max no. of descs from tx ring and stores in out_buffs */
+static inline
+u32 xskq_tx_bulk_store_descs(struct xsk_queue *q, struct xsk_buff_pool *pool,
+			      u32 max)
+{
+	u32 cached_cons = q->cached_cons, nb_entries = 0;
+	
+	while (cached_cons != q->cached_prod && nb_entries < max) {
+		struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
+		u32 idx = cached_cons & q->ring_mask;
+		struct parsed_desc parsed;
+		struct xdp_desc* desc = &ring->desc[idx];
+
+		int out_id = get_outflow(desc, pool);
+		cached_cons++;
+
+		if (unlikely(out_id < 0 || out_id >= pool->n_out_buffs)) {
+			q->invalid_descs++;
+			break;
+		}
+
+		parse_desc(q, pool, desc, &parsed);
+		if (unlikely(!parsed.valid))
+			break;
+		
+		xskq_tx_store_desc(pool, desc, out_id);
+		
+		nb_entries++;
+	}
+
+	/* Release valid plus any invalid entries */
+	xskq_cons_release_n(q, cached_cons - q->cached_cons);
+	return nb_entries;
+}
+
+/* Can be used by kernel to enqueue a desc to rx/tx ring */
+static inline int xskq_enqueue_desc(struct xsk_queue *q, u64 addr, u32 len, u32 flags)
 {	
 	u32 prod_head;
 	u32 prod_next;
@@ -652,7 +745,8 @@ static inline int xskq_enqueue_rxtx(struct xsk_queue *q, u64 addr, u32 len, u32 
 	return 0;
 }
 
-static inline u32 xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* descs, u32 n_descs)
+/* Can be used by kernel to bulk enqueue descs to rx/tx ring */
+static inline u32 xskq_bulk_enqueue_descs(struct xsk_queue *q, struct xdp_desc* descs, u32 n_descs)
 {	
 	u32 prod_head;
 	u32 prod_next;
@@ -662,13 +756,13 @@ static inline u32 xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* d
 	u32 n = xskq_move_prod_head(q, n_descs, &prod_head, &prod_next);
 
 	/* Ring full */
-	if(n == 0) 
+	if (n == 0)
 		return 0;
 
 	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
 	
 	idx = prod_head & q->ring_mask;
-	for(u32 i = 0; i < n; i++) {
+	for (u32 i = 0; i < n; i++) {
 		ring->desc[idx] = descs[i];
 		idx = ((idx + 1) & q->ring_mask);
 	}
@@ -678,14 +772,17 @@ static inline u32 xskq_bulk_enqueue_rxtx(struct xsk_queue *q, struct xdp_desc* d
 	return n;
 }
 
-static inline void xskq_bulk_submit_rxtx(struct xsk_queue *q, struct xdp_desc* descs, u32 prod_head, u32 prod_next, u32 n_descs)
+/* Can be used by kernel to bulk submit descs to rx/tx ring (the head should be moved earlier) */
+static inline 
+void xskq_bulk_submit_descs(struct xsk_queue *q, struct xdp_desc* descs, 
+						u32 prod_head, u32 prod_next, u32 n_descs)
 {
 	u32 idx;
 
 	struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
 	
 	idx = prod_head & q->ring_mask;
-	for(u32 i = 0; i < n_descs; i++) {
+	for (u32 i = 0; i < n_descs; i++) {
 		ring->desc[idx] = descs[i];
 		idx = ((idx + 1) & q->ring_mask);
 	}
@@ -695,30 +792,8 @@ static inline void xskq_bulk_submit_rxtx(struct xsk_queue *q, struct xdp_desc* d
 	return;
 }
 
-static inline int xskq_enqueue_umem(struct xsk_queue *q, u64 addr)
-{	
-	u32 prod_head;
-	u32 prod_next;
-
-	u32 idx;
-
-	u32 n = xskq_move_prod_head(q, 1, &prod_head, &prod_next);
-
-	/* Ring full */
-	if(n == 0) 
-		return -ENOBUFS;
-
-	struct xdp_umem_ring *ring = (struct xdp_umem_ring *)q->ring;
-	
-	idx = prod_head & q->ring_mask;
-	ring->desc[idx] = addr;
-
-	xskq_update_prod_tail((struct xdp_ring *)ring, prod_head, prod_next);
-
-	return 0;
-}
-
-static inline bool xskq_dequeue_rxtx(struct xsk_queue *q, struct xdp_desc* desc, struct xsk_buff_pool *pool)
+/* Can be used by kernel to dequeue a desc from rx/tx ring */
+static inline bool xskq_dequeue_desc(struct xsk_queue *q, struct xdp_desc* desc, struct xsk_buff_pool *pool)
 {	
 	u32 cons_head;
 	u32 cons_next;
@@ -729,7 +804,7 @@ static inline bool xskq_dequeue_rxtx(struct xsk_queue *q, struct xdp_desc* desc,
 	u32 n = xskq_move_cons_head(q, 1, &cons_head, &cons_next);
 
 	/* Ring empty */
-	if(n == 0) 
+	if (n == 0) 
 		return false;
 
 	/* A, matches D */
@@ -738,30 +813,8 @@ static inline bool xskq_dequeue_rxtx(struct xsk_queue *q, struct xdp_desc* desc,
 
 	xskq_update_cons_tail((struct xdp_ring *)ring, cons_head, cons_next);
 
-	if(pool)
+	if (pool)
 		return xskq_cons_is_valid_desc(q, desc, pool);
-	return true;
-}
-
-static inline bool xskq_dequeue_umem(struct xsk_queue *q, u64* addr)
-{	
-	u32 cons_head;
-	u32 cons_next;
-
-	struct xdp_umem_ring *ring = (struct xdp_umem_ring *)q->ring;
-	u32 idx;
-
-	u32 n = xskq_move_cons_head(q, 1, &cons_head, &cons_next);
-
-	/* Ring empty */
-	if(n == 0) 
-		return false;
-
-	/* A, matches D */
-	idx = cons_head & q->ring_mask;
-	*addr = ring->desc[idx];
-
-	xskq_update_cons_tail((struct xdp_ring *)ring, cons_head, cons_next);
 
 	return true;
 }

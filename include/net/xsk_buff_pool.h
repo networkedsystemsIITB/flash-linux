@@ -80,10 +80,12 @@ struct xsk_buff_pool {
 	struct xdp_desc *tx_descs;
 
 	/* For enabling batching in flash */
+	struct xdp_desc *rx_descs;			// Array of rx descs for batching
+	u32 n_rx_descs;
 	struct chain_out_buff* out_buffs;	// Array of out buffers
 	u32 n_out_buffs;					
 	struct xdp_buff **fq_buff_batch;	// Temp storage for fq buffers
-	u32 n_cq_reserved;					// No. of descs reserved in CQ
+	u32 n_cq_reserved;					// No. of descs reserved in cq
 	bool no_tx_out;						// Flag to prevent driver sending packet out
 
 	u64 chunk_mask;
@@ -124,6 +126,7 @@ int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
 int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_sock *umem_xs,
 			 struct net_device *dev, u16 queue_id);
 int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs);
+int xp_alloc_rx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); /* flash */
 int xp_alloc_chain_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); /* flash */
 int xp_alloc_chain_fq_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); /* flash */
 int alloc_out_buffs(struct xdp_sock *xs, int *next_id, int n); /* flash */

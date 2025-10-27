@@ -5,8 +5,11 @@
 
 #include <linux/string.h>
 #include <linux/slab.h>
+#include <linux/ctype.h>
 
 #include "xsk_sysfs.h"
+
+int flash_tx_tracking = 0;
 
 static struct kset *flash_kset = NULL;
 
@@ -14,7 +17,7 @@ static struct kset *flash_kset = NULL;
  * The default show function that must be passed to sysfs.  This will be
  * called by sysfs for whenever a show function is called by the user on a
  * sysfs file associated with the kobjects we have registered.  We need to
- * transpose back from a "default" kobject to our custom struct foo_obj and
+ * transpose back from a "default" kobject to our custom struct flash_obj and
  * then call the show function for that specific object.
  */
 static ssize_t flash_attr_show(struct kobject *kobj, struct attribute *attr, char *buf)
@@ -57,7 +60,7 @@ static const struct sysfs_ops flash_sysfs_ops = {
 
 /*
  * The release function for our object.  This is REQUIRED by the kernel to
- * have.  We free the memory held in our object here.
+ * have. We free the memory held in our object here.
  */
 static void flash_release(struct kobject *kobj)
 {
@@ -123,71 +126,78 @@ static ssize_t rw_int_show(struct flash_obj *obj, struct flash_attribute *attr, 
 
 static ssize_t rw_int_store(struct flash_obj *obj, struct flash_attribute *attr, const char *buf, size_t count)
 {
-    int ret, next, current_id;
-    int i = 0;
+    int ret, current_id;
+    int *next_ids = NULL;
     int next_count = 0;
-    int *next_ids;
-    const char *p = buf;
+    const char *ptr = buf;
     char temp[16];
 
     ret = kstrtoint(obj->kobj.name, 10, &current_id);
     if (ret < 0)
         return ret;
 
-    /* Count number of next entries */
-    while (*p) {
-        while (*p && *p != ' ') {
-            p++;
-        }
-        next_count++;
-        // Skip any spaces
-        while (*p == ' ')
-            p++;
-    }
-    if (next_count == 0)
-        return -EINVAL;
-
-    next_ids = kvzalloc(next_count * sizeof(int), GFP_KERNEL);
+    /*
+     * Estimate the maximum number of possible entries
+     * (worst case: every character is a digit or space)
+     */
+    size_t max_entries = count / 2 + 1;
+    next_ids = kvzalloc(max_entries * sizeof(int), GFP_KERNEL);
     if (!next_ids)
         return -ENOMEM;
 
-    p = buf;
-    i = 0;
-    while (*p) {
-        // Copy the substring to the temporary buffer
+    while (*ptr) {
         int len = 0;
-        while (*p && *p != ' ' && len < sizeof(temp) - 1) {
-            temp[len++] = *p++;
-        }
-        temp[len] = '\0'; // Null-terminate the substring
 
-        // Convert the substring to an integer
-        ret = kstrtoint(temp, 10, &next);
+        while (*ptr == ' ')
+            ptr++;
+
+        if (*ptr == '\n')
+            break;
+
+        while (*ptr && *ptr != ' ' && *ptr != '\n' && len < sizeof(temp) - 1)
+            temp[len++] = *ptr++;
+
+        if (len == 0)
+            continue;
+
+        temp[len] = '\0';
+        if (!(isdigit(temp[0]) || temp[0] == '-')) {
+            ret = -EINVAL;
+            goto out;
+        }
+        for (int i = 1; temp[i]; i++) {
+            if (!isdigit(temp[i])) {
+                ret = -EINVAL;
+                goto out;
+            }
+        }
+        ret = kstrtoint(temp, 10, &next_ids[next_count]);
         if (ret < 0)
             goto out;
 
-        printk("Next: %d\n", next);
-        next_ids[i++] = next;
+        next_count++;
+    }
 
-        // Skip any spaces
-        while (*p == ' ')
-            p++;
+    if (next_count == 0) {
+        ret = -EINVAL;
+        goto out;
     }
 
     ret = flash_update_chain_map(current_id, next_ids, next_count);
-    if (ret < 0) {
+    if (ret < 0)
         goto out;
-    } else if (ret == 1){
+
+    if (ret == 1) {
         obj->next_count = 0;
         kvfree(obj->next);
+        obj->next = NULL;
         kvfree(next_ids);
         return count;
     }
 
-    obj->next_count = next_count;
-    if (!obj->next)
-        kvfree(obj->next);
+    kvfree(obj->next);
     obj->next = next_ids;
+    obj->next_count = next_count;
 
     return count;
 
@@ -232,7 +242,6 @@ struct flash_obj *create_flash_obj(int flash_id, int pid, const char *procname, 
 
     snprintf(flash_name, sizeof(flash_name), "%d", flash_id);
 
-    /* allocate the memory for the whole object */
     obj = kzalloc(sizeof(*obj), GFP_KERNEL);
     if (!obj)
         return NULL;
@@ -254,12 +263,11 @@ struct flash_obj *create_flash_obj(int flash_id, int pid, const char *procname, 
     strcpy(obj->procname, procname);
 
     /*
-     * Initialize and add the kobject to the kernel.  All the default files
-     * will be created here.  As we have already specified a kset for this
+     * Initialize and add the kobject to the kernel. All the default files
+     * will be created here. As we have already specified a kset for this
      * kobject, we don't have to set a parent for the kobject, the kobject
      * will be placed beneath that kset automatically.
      */
-
     retval = kobject_init_and_add(&obj->kobj, &flash_ktype, NULL, "%s", flash_name);
     if (retval) {
         kfree(obj);
@@ -275,32 +283,64 @@ struct flash_obj *create_flash_obj(int flash_id, int pid, const char *procname, 
     return obj;
 }
 
+void clear_flash_redr(struct flash_obj *obj)
+{
+    obj->next_count = 0;
+    kvfree(obj->next);
+    obj->next = NULL;
+}
+
 void destroy_flash_obj(struct flash_obj *obj)
 {
+    kvfree(obj->next);
     kobject_put(&obj->kobj);
 }
 
-/*
- * @brief The module entry that sets up the sysfs directory
- */
+static ssize_t tx_tracking_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%d\n", flash_tx_tracking);
+}
+
+static ssize_t tx_tracking_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+    int val, ret;
+
+    ret = kstrtoint(buf, 10, &val);
+    if (ret < 0)
+        return ret;
+
+    if (val != 0 && val != 1)
+        return -EINVAL;
+
+    flash_tx_tracking = val;
+    pr_info("flash_sysfs: tx_tracking set to %d\n", flash_tx_tracking);
+
+    return count;
+}
+
+static struct kobj_attribute tx_tracking_attribute = __ATTR(tx_tracking, 0644, tx_tracking_show, tx_tracking_store);
+
 int flash_sysfs_init(void)
 {
     /*
-     * Create a kset with the name of "flash",
+     * Create a kset dynamically with the name of "flash",
      * located under /sys/kernel/
      */
     flash_kset = kset_create_and_add("flash", NULL, kernel_kobj);
     if (!flash_kset)
         return ENOMEM;
 
+    if (sysfs_create_file(&flash_kset->kobj, &tx_tracking_attribute.attr)) {
+        pr_err("flash_sysfs: failed to create tx_tracking attribute\n");
+        kset_unregister(flash_kset);
+        return -ENOMEM;
+    }
+
     return 0;
 }
 
-/*
- * @brief The exit point
- * In kernel this should not be present. Right?
- */
-// static void flash_exit(void)
-// {
-//     kset_unregister(flash_kset);
-// }
+void flash_sysfs_exit(void)
+{
+    sysfs_remove_file(&flash_kset->kobj, &tx_tracking_attribute.attr);
+    kset_unregister(flash_kset);
+}

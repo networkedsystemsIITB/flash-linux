@@ -41,6 +41,7 @@ void xp_destroy(struct xsk_buff_pool *pool)
 	kvfree(pool->fq_buff_batch);
 	destroy_out_buffs(pool);
 
+	kvfree(pool->rx_descs);
 	kvfree(pool->tx_descs);
 	kvfree(pool->heads);
 	kvfree(pool);
@@ -51,6 +52,18 @@ int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
 	pool->tx_descs = kvcalloc(xs->tx->nentries, sizeof(*pool->tx_descs),
 				  GFP_KERNEL);
 	if (!pool->tx_descs)
+		return -ENOMEM;
+
+	return 0;
+}
+
+/* rx batching for flash */
+int xp_alloc_rx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
+{
+	pool->n_rx_descs = 0;
+	pool->rx_descs = kvcalloc(xs->rx->nentries, sizeof(*pool->rx_descs),
+				  GFP_KERNEL);
+	if (!pool->rx_descs)
 		return -ENOMEM;
 
 	return 0;
@@ -118,9 +131,7 @@ int alloc_out_buffs(struct xdp_sock *xs, int* next_id, int n)
 			goto out;
 
 	for (int i = 0; i < n; i++)
-	{
 		pool->out_buffs[i].dst_flash_id = next_id[i];
-	}
 
 	return 0;
 out:
@@ -145,6 +156,9 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	if (!pool->heads)
 		goto out;
 
+	if (xs->rx)
+		if (xp_alloc_rx_descs(pool, xs))
+			goto out;
 	if (xs->tx)
 		if (xp_alloc_tx_descs(pool, xs))
 			goto out;
@@ -155,10 +169,6 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	pool->n_cq_reserved = 0;
 	pool->no_tx_out = false;
 
-	xs->rx->n_rx_descs = 0; 
-	xs->rx->rx_descs = kvcalloc(xs->rx->nentries, sizeof(struct xdp_desc), GFP_KERNEL);
-	if(!xs->rx->rx_descs)
-		goto out;
 
 	pool->chunk_mask = ~((u64)umem->chunk_size - 1);
 	pool->addrs_cnt = umem->size;
@@ -188,7 +198,6 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	pool->fq_buff_batch = kvcalloc(pool->fq->nentries, sizeof(struct xdp_buff *), GFP_KERNEL);
 	if (!pool->fq_buff_batch)
 		goto out;
-
 
 	for (i = 0; i < pool->free_heads_cnt; i++) {
 		xskb = &pool->heads[i];
@@ -607,7 +616,7 @@ static struct xdp_buff_xsk *__xp_alloc(struct xsk_buff_pool *pool)
 		// }
 
 		/* SPMC */
-		if (!xskq_dequeue_umem(pool->fq, &addr)) {
+		if (!xskq_dequeue_addr(pool->fq, &addr)) {
 			pool->fq->queue_empty_descs++;
 			return NULL;
 		}
