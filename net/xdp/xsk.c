@@ -496,23 +496,27 @@ void handle_zero_copy(struct xsk_buff_pool *pool, struct chain_out_buff *out_buf
 	/* Add chain_fq_descs of next socket to cq */
 	xskq_prod_write_addr_batch(pool->cq, out_buff->chain_fq_descs + out_buff->n_chain_fq_descs - rx, rx);
 
-	struct xdp_desc *descs = out_buff->chain_fq_descs + out_buff->n_chain_fq_descs - rx;
-	struct xsk_buff_pool *flash_pool = flash_xs->pool;
-	uint8_t edge_id = out_buff - pool->out_buffs;
-	void *data_ptr;
-	u64 addr;
-	for (u32 i = 0; i < rx; i++) {
-		addr = descs[i].addr;
-		data_ptr = flash_pool->addrs;
-		if (flash_pool->unaligned) {
-			addr = (addr & XSK_UNALIGNED_BUF_ADDR_MASK) + (addr >> XSK_UNALIGNED_BUF_OFFSET_SHIFT);
-		}
-		data_ptr += addr;
-		// void *data_ptr = xsk_buff_raw_get_data(flash_xs->pool, descs[i].addr);
-		if (data_ptr) {
-			*(uint8_t *)data_ptr = edge_id;
+	/* Mark the buffers with edge_id for tracking (if enabled) */
+	if (flash_tx_tracking) {
+		struct xdp_desc *descs = out_buff->chain_fq_descs + out_buff->n_chain_fq_descs - rx;
+		struct xsk_buff_pool *flash_pool = flash_xs->pool;
+		uint8_t edge_id = out_buff - pool->out_buffs;
+		void *data_ptr;
+		u64 addr;
+		for (u32 i = 0; i < rx; i++) {
+			addr = descs[i].addr;
+			data_ptr = flash_pool->addrs;
+			if (flash_pool->unaligned) {
+				addr = (addr & XSK_UNALIGNED_BUF_ADDR_MASK) + (addr >> XSK_UNALIGNED_BUF_OFFSET_SHIFT);
+			}
+			data_ptr += addr;
+			// void *data_ptr = xsk_buff_raw_get_data(flash_xs->pool, descs[i].addr);
+			if (data_ptr) {
+				*(uint8_t *)data_ptr = edge_id;
+			}
 		}
 	}
+
 	sock_def_readable(&flash_xs->sk);
 	*rx_entries = rx;
 }
@@ -522,7 +526,6 @@ void handle_single_copy(struct xsk_buff_pool *pool, struct chain_out_buff *out_b
                     struct xdp_sock *flash_xs, u32 *fq_entries, u32 *rx_entries)
 {
 	u32 prod_head, prod_next, fq, rx;
-
 	fq = *fq_entries;
 	/* Try reserving fq_entries */
 	rx = xskq_move_prod_head(flash_xs->rx, fq, &prod_head, &prod_next);
