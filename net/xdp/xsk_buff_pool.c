@@ -37,9 +37,23 @@ void xp_destroy(struct xsk_buff_pool *pool)
 	if (!pool)
 		return;
 
+	/* For batching in flash */
+	kvfree(pool->rx_descs);
 	kvfree(pool->tx_descs);
 	kvfree(pool->heads);
 	kvfree(pool);
+}
+
+/* rx batching for flash */
+int xp_alloc_rx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
+{
+	pool->n_rx_descs = 0;
+	pool->rx_descs = kvcalloc(xs->rx->nentries, sizeof(*pool->rx_descs),
+				  GFP_KERNEL);
+	if (!pool->rx_descs)
+		return -ENOMEM;
+
+	return 0;
 }
 
 int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs)
@@ -69,6 +83,9 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
 	if (!pool->heads)
 		goto out;
 
+	if (xs->rx)
+		if (xp_alloc_rx_descs(pool, xs))
+			goto out;
 	if (xs->tx)
 		if (xp_alloc_tx_descs(pool, xs))
 			goto out;
@@ -506,7 +523,8 @@ static struct xdp_buff_xsk *__xp_alloc(struct xsk_buff_pool *pool)
 		return NULL;
 
 	for (;;) {
-		if (!xskq_cons_peek_addr_unchecked(pool->fq, &addr)) {
+		/* SPMC */
+		if (!xskq_dequeue_addr(pool->fq, &addr)) {
 			pool->fq->queue_empty_descs++;
 			return NULL;
 		}
@@ -515,7 +533,6 @@ static struct xdp_buff_xsk *__xp_alloc(struct xsk_buff_pool *pool)
 		     xp_check_aligned(pool, &addr);
 		if (!ok) {
 			pool->fq->invalid_descs++;
-			xskq_cons_release(pool->fq);
 			continue;
 		}
 		break;
@@ -530,7 +547,6 @@ static struct xdp_buff_xsk *__xp_alloc(struct xsk_buff_pool *pool)
 		xskb = &pool->heads[xp_aligned_extract_idx(pool, addr)];
 	}
 
-	xskq_cons_release(pool->fq);
 	return xskb;
 }
 
@@ -563,12 +579,20 @@ EXPORT_SYMBOL(xp_alloc);
 static u32 xp_alloc_new_from_fq(struct xsk_buff_pool *pool, struct xdp_buff **xdp, u32 max)
 {
 	u32 i, cached_cons, nb_entries;
+	u32 cons_head = 0, cons_next = 0;
 
 	if (max > pool->free_heads_cnt)
 		max = pool->free_heads_cnt;
-	max = xskq_cons_nb_entries(pool->fq, max);
 
-	cached_cons = pool->fq->cached_cons;
+	/* SPMC */
+	max = xskq_move_cons_head(pool->fq, max, &cons_head, &cons_next);
+
+	if (!max)
+		return 0;
+
+	/* SPMC */
+	cached_cons = cons_head;
+
 	nb_entries = max;
 	i = max;
 	while (i--) {
@@ -599,7 +623,9 @@ static u32 xp_alloc_new_from_fq(struct xsk_buff_pool *pool, struct xdp_buff **xd
 		xdp++;
 	}
 
-	xskq_cons_release_n(pool->fq, max);
+	/* SPMC */
+	xskq_update_cons_tail(pool->fq->ring, cons_head, cons_next);
+
 	return nb_entries;
 }
 
@@ -658,7 +684,9 @@ bool xp_can_alloc(struct xsk_buff_pool *pool, u32 count)
 {
 	if (pool->free_list_cnt >= count)
 		return true;
-	return xskq_cons_has_entries(pool->fq, count - pool->free_list_cnt);
+
+	/* SPMC */
+	return xskq_cons_available_entries(pool->fq, count - pool->free_list_cnt);
 }
 EXPORT_SYMBOL(xp_can_alloc);
 

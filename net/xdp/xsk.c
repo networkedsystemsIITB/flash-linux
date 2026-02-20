@@ -141,14 +141,11 @@ static int __xsk_rcv_zc(struct xdp_sock *xs, struct xdp_buff_xsk *xskb, u32 len,
 			u32 flags)
 {
 	u64 addr;
-	int err;
 
 	addr = xp_get_handle(xskb);
-	err = xskq_prod_reserve_desc(xs->rx, addr, len, flags);
-	if (err) {
-		xs->rx_queue_full++;
-		return err;
-	}
+
+	/* Batching Rx */
+	xskq_rx_store_desc(xs->pool, addr, len, flags);
 
 	xp_release(xskb);
 	return 0;
@@ -330,8 +327,16 @@ static int xsk_rcv_check(struct xdp_sock *xs, struct xdp_buff *xdp, u32 len)
 
 static void xsk_flush(struct xdp_sock *xs)
 {
-	xskq_prod_submit(xs->rx);
-	__xskq_cons_release(xs->pool->fq);
+	/* Batching Rx */
+	u32 num;
+	num = xskq_bulk_enqueue_descs(xs->rx, xs->pool->rx_descs, xs->pool->n_rx_descs);
+	xskq_rx_reset_descs(xs->pool);
+
+	if (unlikely(!num)) {
+		xs->rx_queue_full++;
+		return;
+	}
+
 	sock_def_readable(&xs->sk);
 }
 

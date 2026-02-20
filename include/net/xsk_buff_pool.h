@@ -69,6 +69,11 @@ struct xsk_buff_pool {
 	dma_addr_t *dma_pages;
 	struct xdp_buff_xsk *heads;
 	struct xdp_desc *tx_descs;
+
+	/* For enabling batching in flash */
+	struct xdp_desc *rx_descs; /* Array of rx descs for batching */
+	u32 n_rx_descs;
+	
 	u64 chunk_mask;
 	u64 addrs_cnt;
 	u32 free_list_cnt;
@@ -106,6 +111,7 @@ int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
 		  u16 queue_id, u16 flags);
 int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_sock *umem_xs,
 			 struct net_device *dev, u16 queue_id);
+int xp_alloc_rx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs);
 int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs);
 void xp_destroy(struct xsk_buff_pool *pool);
 void xp_get_pool(struct xsk_buff_pool *pool);
