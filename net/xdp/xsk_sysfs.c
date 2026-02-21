@@ -273,6 +273,13 @@ struct flash_obj *create_flash_obj(int flash_id, int pid, const char *procname, 
     return obj;
 }
 
+void clear_flash_redr(struct flash_obj *obj)
+{
+    obj->next_count = 0;
+    kvfree(obj->next);
+    obj->next = NULL;
+}
+
 void destroy_flash_obj(struct flash_obj *obj)
 {
     kvfree(obj->next);

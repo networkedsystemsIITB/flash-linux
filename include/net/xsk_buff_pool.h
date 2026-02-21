@@ -20,6 +20,15 @@ struct xdp_sock;
 struct device;
 struct page;
 
+/* Buffer corresponding each outflow on a NF */
+struct chain_out_buff{
+	struct xdp_desc *chain_tx_descs;
+	u32 n_chain_tx_descs;
+	struct xdp_desc* chain_fq_descs;
+	u32 n_chain_fq_descs;
+	int dst_flash_id;	// Flash ID of destination NF
+};
+
 #define XSK_PRIV_MAX 24
 
 struct xdp_buff_xsk {
@@ -73,6 +82,11 @@ struct xsk_buff_pool {
 	/* For enabling batching in flash */
 	struct xdp_desc *rx_descs; /* Array of rx descs for batching */
 	u32 n_rx_descs;
+	struct chain_out_buff* out_buffs; /* Array of out buffers */
+	u32 n_out_buffs;					
+	struct xdp_buff **fq_buff_batch; /* Temp storage for fq buffers */ 
+	u32 n_cq_reserved; /* No. of descs reserved in cq*/
+	bool no_tx_out; /* Flag to prevent driver sending packet out */
 	
 	u64 chunk_mask;
 	u64 addrs_cnt;
@@ -113,6 +127,10 @@ int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_sock *umem_xs,
 			 struct net_device *dev, u16 queue_id);
 int xp_alloc_rx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs);
 int xp_alloc_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs);
+int xp_alloc_chain_tx_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); /* flash */
+int xp_alloc_chain_fq_descs(struct xsk_buff_pool *pool, struct xdp_sock *xs); /* flash */
+int alloc_out_buffs(struct xdp_sock *xs, int *next_id, int n); /* flash */
+void destroy_out_buffs(struct xsk_buff_pool *pool); /* flash */
 void xp_destroy(struct xsk_buff_pool *pool);
 void xp_get_pool(struct xsk_buff_pool *pool);
 bool xp_put_pool(struct xsk_buff_pool *pool);
@@ -236,6 +254,13 @@ static inline u64 xp_get_handle(struct xdp_buff_xsk *xskb)
 	if (!xskb->pool->unaligned)
 		return xskb->orig_addr + offset;
 	return xskb->orig_addr + (offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT);
+}
+
+static inline void xsk_buff_reset_size(struct xdp_buff_xsk *xskb)
+{
+	xskb->xdp.data = xskb->xdp.data_hard_start + XDP_PACKET_HEADROOM;
+	xskb->xdp.data_meta = xskb->xdp.data;
+	xskb->xdp.flags = 0;
 }
 
 static inline bool xp_tx_metadata_enabled(const struct xsk_buff_pool *pool)

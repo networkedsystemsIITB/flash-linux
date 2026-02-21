@@ -2,7 +2,7 @@
 VERSION = 6
 PATCHLEVEL = 10
 SUBLEVEL = 6
-EXTRAVERSION = -v2-flash
+EXTRAVERSION = -v3-flash
 NAME = Baby Opossum Posse
 
 # *DOCUMENTATION*

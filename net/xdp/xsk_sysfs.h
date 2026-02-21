@@ -37,6 +37,7 @@ struct flash_attribute {
 
 /* flash sysfs functions */
 struct flash_obj *create_flash_obj(int flash_id, int pid, const char *procname, int ifindex, int qid);
+void clear_flash_redr(struct flash_obj *obj);
 void destroy_flash_obj(struct flash_obj *obj);
 int flash_sysfs_init(void);
 void flash_sysfs_exit(void);

@@ -410,6 +410,9 @@ static bool ixgbe_xmit_zc(struct ixgbe_ring *xdp_ring, unsigned int budget)
 		if (!xsk_tx_peek_desc(pool, &desc))
 			break;
 
+		if (pool->no_tx_out)
+			continue;
+
 		dma = xsk_buff_raw_get_dma(pool, desc.addr);
 		xsk_buff_raw_dma_sync_for_device(pool, dma, desc.len);
 
@@ -439,6 +442,8 @@ static bool ixgbe_xmit_zc(struct ixgbe_ring *xdp_ring, unsigned int budget)
 		ixgbe_xdp_ring_update_tail(xdp_ring);
 		xsk_tx_release(pool);
 	}
+	else if	(pool->no_tx_out)
+		xsk_tx_release(pool);
 
 	return !!budget && work_done;
 }
