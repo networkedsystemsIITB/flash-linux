@@ -30,12 +30,20 @@
 
 #include "xsk_queue.h"
 #include "xdp_umem.h"
+#include "xsk_sysfs.h"
 #include "xsk.h"
 
 #define TX_BATCH_SIZE 32
 #define MAX_PER_SOCKET_BUDGET (TX_BATCH_SIZE)
+/* Maximum number of XSKs that can be chained - [TODO: Dynamic] (flash) */
+#define FLASH_MAX_XSK 64
 
 static DEFINE_PER_CPU(struct list_head, xskmap_flush_list);
+static DEFINE_IDR(flash_idr); /* IDR allocation (flash) */
+/* Lock to protect idr accesses (flash) */
+static DEFINE_SPINLOCK(flash_idr_lock);
+/* Cache for getting socket pointer using flash_id - [TODO: Dynamic] (flash) */
+static struct xdp_sock *cache_xs[FLASH_MAX_XSK] = {NULL};
 
 void xsk_set_rx_need_wakeup(struct xsk_buff_pool *pool)
 {
@@ -880,7 +888,7 @@ static int xsk_generic_xmit(struct sock *sk)
 	/* Drop the RCU lock since the SKB path might sleep. */
 	rcu_read_unlock();
 	ret = __xsk_generic_xmit(sk);
-	/* Reaquire RCU lock before going into common code. */
+	/* Reacquire RCU lock before going into common code. */
 	rcu_read_lock();
 
 	return ret;
@@ -1160,6 +1168,45 @@ static bool xsk_validate_queues(struct xdp_sock *xs)
 	return xs->fq_tmp && xs->cq_tmp;
 }
 
+static int alloc_flash_id(struct xdp_sock *xs)
+{
+	int retval;
+	unsigned long flags;
+
+	spin_lock_irqsave(&flash_idr_lock, flags);
+	retval = idr_alloc(&flash_idr, xs, 0, FLASH_MAX_XSK, GFP_KERNEL);
+	if (retval >= 0) {
+		xs->flash_id = retval;
+		retval = 0;
+	} else if (retval == -ENOSPC) {
+		pr_warn("Exceeded maximum number of XSKs\n");
+		retval = -EINVAL;
+	}
+	spin_unlock_irqrestore(&flash_idr_lock, flags);
+	return retval;
+}
+
+static struct xdp_sock *find_xsk_by_flash_id(int id)
+{
+	struct xdp_sock *xs;
+	unsigned long flags;
+
+	spin_lock_irqsave(&flash_idr_lock, flags);
+	xs = idr_find(&flash_idr, id);
+	spin_unlock_irqrestore(&flash_idr_lock, flags);
+	return xs;
+}
+
+static void free_flash_id(int id)
+{	
+	cache_xs[id] = NULL;
+
+	unsigned long flags;
+	spin_lock_irqsave(&flash_idr_lock, flags);
+	idr_remove(&flash_idr, id);
+	spin_unlock_irqrestore(&flash_idr_lock, flags);
+}
+
 static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 {
 	struct sockaddr_xdp *sxdp = (struct sockaddr_xdp *)addr;
@@ -1203,6 +1250,21 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 	}
 
 	qid = sxdp->sxdp_queue_id;
+
+	/* Allocate flash id and store the pointer (flash) */
+	err = alloc_flash_id(xs);
+	if (err)
+		goto out_unlock;
+
+	/* Store the pointer in the cache */
+	cache_xs[xs->flash_id] = xs;
+
+	/* Create flash object for sysfs */
+	xs->flash_object = (void *)create_flash_obj(xs->flash_id, current->pid, current->comm, sxdp->sxdp_ifindex, qid);
+	if (!xs->flash_object) {
+		err = -EINVAL;
+		goto out_unlock;
+	}
 
 	if (flags & XDP_SHARED_UMEM) {
 		struct xdp_sock *umem_xs;
@@ -1303,6 +1365,9 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
 		}
 	}
 
+	/* Debug (flash) */
+	pr_info("flash_id = %d\n", xs->flash_id);
+
 	/* FQ and CQ are now owned by the buffer pool and cleaned up with it. */
 	xs->fq_tmp = NULL;
 	xs->cq_tmp = NULL;
@@ -1327,6 +1392,37 @@ out_release:
 	mutex_unlock(&xs->mutex);
 	rtnl_unlock();
 	return err;
+}
+
+int flash_update_chain_map(int current_id, int *next_ids, int next_count)
+{
+	struct xdp_sock *dst_xsk, *src_xsk;
+
+	if (next_ids == NULL)
+		return -EINVAL;
+
+	src_xsk = find_xsk_by_flash_id(current_id);
+	if (src_xsk == NULL || src_xsk != cache_xs[current_id])
+		return -EINVAL;
+
+	if (src_xsk->state != XSK_READY && src_xsk->state != XSK_BOUND)
+		return -EBUSY;
+
+	if (next_ids[0] == -1) {
+		/* Unchain the socket. */
+		return 1;
+	}
+
+	for (int i = 0; i < next_count; i++) {
+		dst_xsk = find_xsk_by_flash_id(next_ids[i]);
+		if (dst_xsk == NULL || dst_xsk != cache_xs[next_ids[i]] || dst_xsk == src_xsk)
+			return -EINVAL;
+		pr_info("chain: %d->%d\n", current_id, next_ids[i]);
+	}
+
+	/* Chain the socket to the next ones. */
+
+	return 0;
 }
 
 struct xdp_umem_reg_v1 {
@@ -1699,6 +1795,13 @@ static void xsk_destruct(struct sock *sk)
 
 	if (!xp_put_pool(xs->pool))
 		xdp_put_umem(xs->umem, !xs->pool);
+	
+	if (xs->flash_id == -1)
+		return;
+
+	/* Freeing up id and obj */
+	free_flash_id(xs->flash_id);
+	destroy_flash_obj((struct flash_obj *)xs->flash_object);
 }
 
 static int xsk_create(struct net *net, struct socket *sock, int protocol,
@@ -1733,6 +1836,7 @@ static int xsk_create(struct net *net, struct socket *sock, int protocol,
 
 	xs = xdp_sk(sk);
 	xs->state = XSK_READY;
+	xs->flash_id = -1;
 	mutex_init(&xs->mutex);
 	spin_lock_init(&xs->rx_lock);
 
@@ -1794,11 +1898,17 @@ static int __init xsk_init(void)
 	err = register_netdevice_notifier(&xsk_netdev_notifier);
 	if (err)
 		goto out_pernet;
+	
+	err = flash_sysfs_init();
+	if (err)
+		goto out_sysfs;
 
 	for_each_possible_cpu(cpu)
 		INIT_LIST_HEAD(&per_cpu(xskmap_flush_list, cpu));
 	return 0;
 
+out_sysfs:
+	flash_sysfs_exit();
 out_pernet:
 	unregister_pernet_subsys(&xsk_net_ops);
 out_sk:

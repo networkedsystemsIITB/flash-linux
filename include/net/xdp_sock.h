@@ -91,6 +91,11 @@ struct xdp_sock {
 	struct mutex mutex;
 	struct xsk_queue *fq_tmp; /* Only as tmp storage before bind */
 	struct xsk_queue *cq_tmp; /* Only as tmp storage before bind */
+
+	/* Socket ID that is used for socket chaining (flash) */
+	int flash_id;
+	/* Pointer to flash_obj (flash) */
+	void *flash_object;
 };
 
 /*
