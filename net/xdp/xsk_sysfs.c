@@ -9,6 +9,8 @@
 
 #include "xsk_sysfs.h"
 
+int flash_tx_tracking = 0;
+
 static struct kset *flash_kset = NULL;
 
 /* The default show function that must be passed to sysfs. This will be
@@ -286,6 +288,30 @@ void destroy_flash_obj(struct flash_obj *obj)
     kobject_put(&obj->kobj);
 }
 
+static ssize_t tx_tracking_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%d\n", flash_tx_tracking);
+}
+
+static ssize_t tx_tracking_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count)
+{
+    int val, ret;
+
+    ret = kstrtoint(buf, 10, &val);
+    if (ret < 0)
+        return ret;
+
+    if (val != 0 && val != 1)
+        return -EINVAL;
+
+    flash_tx_tracking = val;
+    pr_info("flash_sysfs: tx_tracking set to %d\n", flash_tx_tracking);
+
+    return count;
+}
+
+static struct kobj_attribute tx_tracking_attribute = __ATTR(tx_tracking, 0644, tx_tracking_show, tx_tracking_store);
+
 int flash_sysfs_init(void)
 {
     /*
@@ -296,10 +322,17 @@ int flash_sysfs_init(void)
     if (!flash_kset)
         return ENOMEM;
 
+    if (sysfs_create_file(&flash_kset->kobj, &tx_tracking_attribute.attr)) {
+        pr_err("flash_sysfs: failed to create tx_tracking attribute\n");
+        kset_unregister(flash_kset);
+        return -ENOMEM;
+    }
+
     return 0;
 }
 
 void flash_sysfs_exit(void)
 {
+    sysfs_remove_file(&flash_kset->kobj, &tx_tracking_attribute.attr);
     kset_unregister(flash_kset);
 }

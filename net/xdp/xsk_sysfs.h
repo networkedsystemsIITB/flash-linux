@@ -27,6 +27,9 @@ struct flash_obj {
 };
 #define to_flash_obj(x) container_of(x, struct flash_obj, kobj)
 
+/* Global file for all flash objects */
+extern int flash_tx_tracking;
+
 /* a custom attribute that works just for a struct flash_obj. */
 struct flash_attribute {
 	struct attribute attr;
